@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,7 +12,7 @@ from astrbot.api.event import MessageEventResult
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.message.message_event_result import ResultContentType
-from astrbot_plugin_active_sticker.expression import selected_ids
+from astrbot_plugin_active_sticker.expression import selected_ids, shortlist
 from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
 from astrbot_plugin_active_sticker.main import ActiveSticker
 from PIL import Image
@@ -42,6 +43,12 @@ class Event:
     def get_message_outline(self):
         return "这个梗也太好笑了"
 
+    def get_sender_name(self):
+        return "小林"
+
+    def get_group_id(self):
+        return "library"
+
     def get_platform_name(self):
         return "test"
 
@@ -56,7 +63,12 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.stars = {}
         self.context = SimpleNamespace(
             get_registered_star=self.stars.get,
-            get_all_providers=lambda: [],
+            get_all_providers=lambda: [
+                SimpleNamespace(
+                    meta=lambda: SimpleNamespace(id="vision", model="vision"),
+                    provider_config={"modalities": ["image"]},
+                ),
+            ],
             get_config=lambda **_: {"plugin_set": ["*"]},
             register_web_api=lambda *_: None,
             persona_manager=SimpleNamespace(get_persona_v3_by_id=lambda _: {"prompt": "遇到好梗会狂笑"}),
@@ -94,6 +106,15 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
         self.assertEqual(prompt["人格"], "遇到好梗会狂笑")
         self.assertEqual(prompt["当前情绪"], {"inner_state": "笑出眼泪"})
+        self.assertEqual(prompt["当前说话人"], "小林")
+        self.assertEqual(prompt["聊天场合"], "群聊")
+        next_event = Event()
+        await self.plugin.capture(next_event, ProviderRequest())
+        await self.plugin.after_reply(next_event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        next_prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        self.assertEqual({entry["id"] for entry in next_prompt["已发表情"]}, {self.item.id})
+        self.assertTrue(all(entry["after_speaker"] == "小林" for entry in next_prompt["已发表情"]))
 
     async def test_streaming_waits_for_completion_and_model_may_choose_silence(self):
         self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"send":[]}')
@@ -166,6 +187,26 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         release.set()
         await self.plugin.worker
         self.assertEqual(self.library.items[self.item.id].description, "人工描述")
+
+    async def test_pending_import_waits_for_an_available_vision_model(self):
+        content = sticker_image("blue")
+        item, _ = self.library.add("蓝.png", content, inspect_image(content))
+        self.plugin.config["vision_provider_id"] = "removed"
+        self.assertEqual(self.plugin.index_unrecognized(), 0)
+        self.assertFalse(self.plugin.pending)
+        self.context.llm_generate.assert_not_called()
+        self.plugin.config["vision_provider_id"] = ""
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"description":"有点惊讶"}')
+        self.assertEqual(self.plugin.index_unrecognized(), 1)
+        self.assertEqual(self.plugin.index_unrecognized(), 0)
+        await self.plugin.worker
+        self.assertEqual(self.library.items[item.id].description, "有点惊讶")
+
+    def test_recent_sticker_remains_available_for_a_callback_in_a_large_library(self):
+        others = tuple(replace(self.item, id=str(index), description="大家都笑疯了") for index in range(100))
+        picked = shortlist((*others, self.item), "笑疯了", 3, recent_ids=(self.item.id, "removed"))
+        self.assertEqual(len(picked), 48)
+        self.assertIn(self.item, picked)
 
     def test_invalid_model_ids_cannot_select_files(self):
         self.assertEqual(selected_ids('{"send":["../../example"]}', [self.item], 6), ())

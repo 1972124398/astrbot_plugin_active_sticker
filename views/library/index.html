@@ -26,7 +26,7 @@
       </div>
     </header>
     <div id="vision-hint" class="vision-hint" hidden>
-      <span>配置识图模型后，新导入的图片会自动生成描述。</span>
+      <span>设置可用的识图模型后，待识图的图片会自动处理。</span>
       <button id="open-settings" type="button">前往设置</button>
     </div>
     <button id="drop" type="button">
@@ -92,6 +92,7 @@
 <dialog id="editor">
   <div id="edit-form">
     <div class="editor-head"><h2 id="image-name"></h2><button id="close" type="button" aria-label="关闭">×</button></div>
+    <div id="editor-picture" class="picture"></div>
     <label>画面与语气 <textarea id="description" rows="3" maxlength="480"></textarea></label>
     <label>适合怎么回 <textarea id="usage" rows="3" maxlength="400"></textarea></label>
     <label>标签 <input id="tags" placeholder="用逗号分隔"></label>

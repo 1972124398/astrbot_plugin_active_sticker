@@ -7,6 +7,7 @@ let items = [];
 let selection;
 let timer;
 let importing = false;
+let visionReady = false;
 let visible = 30;
 let refreshGeneration = 0;
 const thumbnails = new Map();
@@ -35,22 +36,33 @@ function element(tag, text, cls) {
   return node;
 }
 
+async function showPreview(picture, id) {
+  if (!thumbnails.has(id)) {
+    thumbnails.set(id, bridge.apiGet("preview", { id }).catch(() => {
+      thumbnails.delete(id);
+      return null;
+    }));
+  }
+  const preview = await thumbnails.get(id);
+  if (!picture.isConnected || picture.dataset.id !== id) return;
+  if (!preview?.src) {
+    picture.textContent = "无法预览";
+    return;
+  }
+  const image = element("img");
+  image.alt = "";
+  image.src = preview.src;
+  picture.replaceChildren(image);
+}
+
+
 const observer = new IntersectionObserver((entries) => {
   for (const entry of entries) {
     if (!entry.isIntersecting) continue;
     const picture = entry.target;
     const id = picture.dataset.id;
     observer.unobserve(picture);
-    if (!thumbnails.has(id)) {
-      thumbnails.set(id, bridge.apiGet("preview", { id }).catch(() => null));
-    }
-    thumbnails.get(id).then((preview) => {
-      if (!picture.isConnected || !preview?.src) return;
-      const image = element("img");
-      image.alt = "";
-      image.src = preview.src;
-      picture.replaceChildren(image);
-    });
+    void showPreview(picture, id);
   }
 }, { rootMargin: "240px" });
 
@@ -58,11 +70,15 @@ function openItem(item) {
   selection = item;
   $("delete-confirmation").hidden = true;
   $("image-name").textContent = item.name;
+  const picture = $("editor-picture");
+  picture.dataset.id = item.id;
+  picture.textContent = item.missing ? "源文件缺失" : "正在读取预览…";
+  if (!item.missing) void showPreview(picture, item.id);
   $("description").value = item.description;
   $("usage").value = item.use_when;
   $("tags").value = item.tags.join("、");
   $("enabled").checked = item.enabled;
-  $("identify").disabled = item.pending || item.missing;
+  $("identify").disabled = item.pending || item.missing || !visionReady;
   report("", $("edit-error"));
   editor.showModal();
 }
@@ -94,7 +110,7 @@ function render() {
   const ready = items.filter((item) => itemStatus(item) === "ready").length;
   const pending = items.filter((item) => item.pending).length;
   $("counts").textContent = items.length + " 张图片 · " + ready + " 张可用" + (pending ? " · " + pending + " 张识图中" : "");
-  $("retry").disabled = !items.some((item) => itemStatus(item) === "waiting" && !item.pending && !item.missing);
+  $("retry").disabled = !visionReady || !items.some((item) => itemStatus(item) === "waiting" && !item.pending && !item.missing);
 }
 
 async function refresh() {
@@ -103,10 +119,11 @@ async function refresh() {
   try {
     const snapshot = await bridge.apiGet("library");
     if (generation !== refreshGeneration) return;
-    const changed = JSON.stringify(snapshot.items) !== JSON.stringify(items);
+    const changed = snapshot.vision_configured !== visionReady || JSON.stringify(snapshot.items) !== JSON.stringify(items);
+    visionReady = snapshot.vision_configured;
     items = snapshot.items;
     if (changed || gallery.childElementCount === 0) render();
-    $("vision-hint").hidden = snapshot.vision_configured;
+    $("vision-hint").hidden = visionReady;
     if (items.some((item) => item.pending) || importing) timer = window.setTimeout(refresh, 1800);
   } catch (error) {
     if (generation === refreshGeneration) report(error.message);

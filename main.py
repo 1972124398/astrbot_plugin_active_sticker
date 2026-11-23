@@ -38,6 +38,9 @@ class Turn:
     persona_id: str
     recent: list
     kind: str
+    speaker: str
+    group_chat: bool
+    reply_images: bool = False
     reply: str = ""
     scheduled: bool = False
 
@@ -87,7 +90,11 @@ class ActiveSticker(Star):
             context.register_web_api(f"/{NAME}/{route}", handler, [method], "主动表情面板")
 
     async def initialize(self):
-        self.queue_index(item for item in self.library.items.values() if item.enabled and not item.description)
+        self.index_unrecognized()
+
+    @filter.on_astrbot_loaded()
+    async def resume_index(self):
+        self.index_unrecognized()
 
     async def terminate(self):
         self.closing = True
@@ -199,6 +206,8 @@ class ActiveSticker(Star):
                 persona_id=event.get_extra("_trace_persona_id") or "",
                 recent=recent_dialogue(request),
                 kind="主动发言" if proactive else "聊天回复",
+                speaker="" if proactive else event.get_sender_name()[:100],
+                group_chat=bool(event.get_group_id()),
             ),
         )
 
@@ -220,14 +229,14 @@ class ActiveSticker(Star):
     async def after_reply(self, event: AstrMessageEvent):
         result = event.get_result()
         if result and result.result_content_type == ResultContentType.LLM_RESULT and event._has_send_oper:
-            await self.schedule_expression(event, (result.get_plain_text() or "").strip())
+            await self.schedule_expression(event, result)
 
     @filter.on_decorating_result(priority=-200)
     async def stream_finished(self, event: AstrMessageEvent):
         # On 4.29 native streams have already been delivered at STREAMING_FINISH.
         result = event.get_result()
         if result and result.result_content_type == ResultContentType.STREAMING_FINISH and event._has_send_oper:
-            await self.schedule_expression(event, (result.get_plain_text() or "").strip())
+            await self.schedule_expression(event, result)
 
     def current(self, turn):
         return (
@@ -238,11 +247,13 @@ class ActiveSticker(Star):
             and self.enabled_in(turn.origin)
         )
 
-    async def schedule_expression(self, event, delivered_text):
+    async def schedule_expression(self, event, result):
         turn = event.get_extra(TURN)
         if not turn or turn.scheduled or not self.current(turn):
             return
+        delivered_text = (result.get_plain_text() or "").strip()
         turn.reply = (delivered_text or turn.reply)[-3500:]
+        turn.reply_images = any(isinstance(part, Image) for part in result.chain)
         if not turn.reply or not self.library.available():
             return
         turn.scheduled = True
@@ -257,24 +268,38 @@ class ActiveSticker(Star):
         try:
             if not self.current(turn):
                 return
-            candidates = shortlist(self.library.available(), turn.user + "\n" + turn.reply, turn.number)
-            if not candidates:
-                return
             mood = self.linked("short_term_mood", turn.origin)
             cognition = self.linked("self_cognition", turn.origin)
             recent_stickers = [
-                {"turns_ago": turn.number - number, "seconds_ago": int(time.monotonic() - sent), "image": label}
-                for number, sent, label, persona_id in turn.session.history
+                {
+                    "id": item.id,
+                    "image": item.description,
+                    "after_speaker": speaker,
+                    "turns_ago": turn.number - number,
+                    "seconds_ago": int(time.monotonic() - sent),
+                }
+                for number, sent, item, persona_id, speaker in reversed(turn.session.history)
                 if persona_id == turn.persona_id
             ]
+            candidates = shortlist(
+                self.library.available(),
+                turn.user + "\n" + turn.reply,
+                turn.number,
+                recent_ids=(sticker["id"] for sticker in recent_stickers),
+            )
+            if not candidates:
+                return
             max_images = max(1, min(20, int(self.config.get("burst_limit", 6))))
             scene = {
                 "人格": turn.persona,
                 "额外表情习惯": self.config.get("expression_style", ""),
                 "场景": turn.kind,
+                "聊天场合": "群聊" if turn.group_chat else "私聊",
+                "当前说话人": turn.speaker,
                 "最近对话": turn.recent,
                 "对方这句话": turn.user,
                 "已经发出的回复": turn.reply,
+                "回复已经附图": turn.reply_images,
                 "已发表情": recent_stickers,
                 "当前情绪": mood,
                 "长期表达习惯": {key: cognition[key] for key in ("character", "people") if key in cognition},
@@ -307,26 +332,37 @@ class ActiveSticker(Star):
                     ),
                     timeout=8,
                 )
-                turn.session.history.append((turn.number, time.monotonic(), item.description, turn.persona_id))
+                turn.session.history.append((turn.number, time.monotonic(), item, turn.persona_id, turn.speaker))
         except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
             logger.warning("主动表情发送跳过 (%s)", type(error).__name__)
 
     def vision_provider(self):
-        if provider := self.config.get("vision_provider_id"):
-            return provider
-        providers = self.context.get_all_providers()
-        for provider in providers:
-            if "image" in (provider.provider_config.get("modalities") or []):
+        selected = self.config.get("vision_provider_id")
+        for provider in self.context.get_all_providers():
+            if selected:
+                if provider.meta().id == selected:
+                    return selected
+            elif "image" in (provider.provider_config.get("modalities") or []):
                 return provider.meta().id
         return ""
 
+    def index_unrecognized(self):
+        return self.queue_index(
+            item for item in self.library.items.values() if item.enabled and not item.description
+        )
+
     def queue_index(self, items):
+        if self.closing or not self.vision_provider():
+            return 0
+        queued = 0
         for item in items:
-            if item.id not in self.pending:
+            if item.id not in self.pending and self.library.path(item).is_file():
                 self.index_errors.pop(item.id, None)
                 self.pending[item.id] = item
-        if self.pending and not self.closing and (self.worker is None or self.worker.done()):
+                queued += 1
+        if self.pending and (self.worker is None or self.worker.done()):
             self.worker = asyncio.create_task(self.index_images())
+        return queued
 
     async def index_images(self):
         while self.pending:
@@ -352,7 +388,8 @@ class ActiveSticker(Star):
                     )
                 values = fields(object_response(result.completion_text))
                 if not values["description"]:
-                    self.index_errors[ident] = "模型没有返回有效描述，可重试或手动填写"
+                    if self.library.items.get(ident) is item:
+                        self.index_errors[ident] = "模型没有返回有效描述，可重试或手动填写"
                 else:
                     self.library.update(item, **values)
             except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
@@ -399,6 +436,8 @@ class ActiveSticker(Star):
                 self.config.update(previous)
                 logger.exception("主动表情保存配置失败")
                 return error_response("配置保存失败，请重试", status_code=500)
+            if "vision_provider_id" in values:
+                self.index_unrecognized()
         return json_response({"saved": True})
 
     async def web_library(self):
@@ -471,22 +510,15 @@ class ActiveSticker(Star):
         data = await request.json(default={})
         if not isinstance(data, dict):
             return error_response("无效的识图请求", status_code=400)
-        ident = data.get("id")
-        if isinstance(ident, str):
-            item = self.library.items.get(ident)
-            if not item:
-                return error_response("找不到图片", status_code=404)
-            items = [item]
-        else:
-            items = [
-                item
-                for item in self.library.items.values()
-                if item.enabled and not item.description and self.library.path(item).is_file()
-            ]
         if not self.vision_provider():
-            return error_response("请先在插件配置选择识图模型", status_code=400)
-        self.queue_index(items)
-        return json_response({"queued": len(items)})
+            return error_response("请先在设置中选一个可用的识图模型", status_code=400)
+        if "id" not in data:
+            return json_response({"queued": self.index_unrecognized()})
+        ident = data["id"]
+        item = self.library.items.get(ident) if isinstance(ident, str) else None
+        if not item or not self.library.path(item).is_file():
+            return error_response("找不到图片", status_code=404)
+        return json_response({"queued": self.queue_index([item])})
 
     async def web_catalog(self):
         return file_response(self.library.root / "catalog.md", filename="catalog.md", content_type="text/markdown")
