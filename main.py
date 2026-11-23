@@ -1,0 +1,450 @@
+"""AstrBot hooks for a post-reply expression, and the sticker library's WebUI."""
+
+import asyncio
+import json
+import tempfile
+import time
+from collections import OrderedDict, deque
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.web import PluginUploadFile, error_response, file_response, json_response, request
+from astrbot.core.message.message_event_result import ResultContentType
+
+from .expression import EXPRESSION_PROMPT, VISION_PROMPT, fields, object_response, selected_ids, shortlist
+from .library import MAX_BYTES, StickerLibrary, inspect_image, preview_data, vision_image
+
+NAME = "astrbot_plugin_active_sticker"
+TURN = NAME + ".turn"
+
+
+@dataclass
+class Session:
+    turns: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=12))
+
+
+@dataclass
+class Turn:
+    session: Session
+    number: int
+    origin: str
+    user: str
+    persona: str
+    persona_id: str
+    recent: list
+    kind: str
+    reply: str = ""
+    scheduled: bool = False
+
+
+def message_text(value):
+    if isinstance(value, list):
+        return "\n".join(
+            part.get("text", "")
+            for part in value
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("_no_save")
+        )
+    return value if isinstance(value, str) else ""
+
+
+def recent_dialogue(request):
+    recent = []
+    for message in (request.contexts or [])[-18:]:
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}:
+            content = message_text(message.get("content")).strip()
+            if content:
+                recent.append({"role": message["role"], "text": content[-900:]})
+    return recent[-6:]
+
+
+class ActiveSticker(Star):
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self.library = StickerLibrary(StarTools.get_data_dir(NAME))
+        self.sessions = OrderedDict()
+        self.pending = {}
+        self.index_errors = {}
+        self.worker = None
+        self.tasks = set()
+        self.closing = False
+        for route, handler, method in (
+            ("library", self.web_library, "GET"),
+            ("preview", self.web_preview, "GET"),
+            ("upload", self.web_upload, "POST"),
+            ("edit", self.web_edit, "POST"),
+            ("delete", self.web_delete, "POST"),
+            ("index", self.web_index, "POST"),
+            ("catalog", self.web_catalog, "GET"),
+        ):
+            context.register_web_api(f"/{NAME}/{route}", handler, [method], "主动表情库")
+
+    async def initialize(self):
+        self.queue_index(item for item in self.library.items.values() if item.enabled and not item.description)
+
+    async def terminate(self):
+        self.closing = True
+        tasks = list(self.tasks)
+        if self.worker:
+            tasks.append(self.worker)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def enabled_in(self, origin, name=NAME):
+        allowed = self.context.get_config(umo=origin).get("plugin_set", ["*"])
+        star = self.context.get_registered_star(name)
+        return allowed is None or any(
+            value and value in allowed
+            for value in (
+                "*",
+                name,
+                getattr(star, "plugin_id", None),
+            )
+        )
+
+    def linked(self, role, origin):
+        if not self.config.get("interop_enabled", True) or not self.config.get("link_" + role, True):
+            return {}
+        name = "astrbot_plugin_" + role
+        try:
+            star = self.context.get_registered_star(name)
+            if not star or not star.activated or not self.enabled_in(origin, name):
+                return {}
+            peer = star.star_cls
+            config = getattr(peer, "config", {})
+            if getattr(peer, "closing", False) or not all(
+                config.get(key, True)
+                for key in (
+                    "enabled",
+                    "interop_enabled",
+                    "link_active_sticker",
+                )
+            ):
+                return {}
+            value = peer.companion_snapshot(origin)
+            return value if isinstance(value, dict) else {}
+        except Exception:  # noqa: BLE001 - optional peers are isolated
+            return {}
+
+    def companion_sticker_catalog(self, origin):
+        """Read-only catalog for cognition and other optional consumers."""
+        if (
+            not origin
+            or self.closing
+            or not self.config.get("enabled", True)
+            or not self.config.get("interop_enabled", True)
+            or not self.config.get("link_self_cognition", True)
+            or not self.enabled_in(origin)
+        ):
+            return {}
+        items = self.library.available()
+        return {"version": 1, "items": [item.summary() for item in items]} if items else {}
+
+    def get_persona(self, event, request):
+        persona_id = event.get_extra("_trace_persona_id")
+        if persona_id == "[%None]":
+            return ""
+        if persona_id == "_chatui_default_":
+            from astrbot.core.astr_main_agent_resources import CHATUI_SPECIAL_DEFAULT_PERSONA_PROMPT
+
+            return (
+                CHATUI_SPECIAL_DEFAULT_PERSONA_PROMPT
+                if event.get_extra("enable_default_system_prompt") is not False
+                else ""
+            )
+        if persona_id:
+            persona = self.context.persona_manager.get_persona_v3_by_id(persona_id)
+            if persona:
+                return str(persona.get("prompt") or "")
+        return request.system_prompt or ""
+
+    @filter.on_llm_request(priority=100)
+    async def capture(self, event: AstrMessageEvent, request):
+        if self.closing or not self.config.get("enabled", True) or event.get_extra(TURN):
+            return
+        envelope = event.get_extra("w1_event")
+        message_id = str(event.message_obj.message_id or "")
+        if (
+            event.get_extra("codex_bridge")
+            or message_id.startswith(("codex-job:", "codex-report:", "proactive:codex_bridge:"))
+            or isinstance(envelope, dict)
+            and envelope.get("type") == "task_event"
+        ):
+            return
+        proactive = message_id.startswith("proactive:") or any(
+            event.get_extra(role) for role in ("play_together", "self_amusement")
+        )
+        origin = event.unified_msg_origin
+        session = self.sessions.setdefault(origin, Session())
+        self.sessions.move_to_end(origin)
+        if len(self.sessions) > 512:
+            self.sessions.popitem(last=False)
+        session.turns += 1
+        event.set_extra(
+            TURN,
+            Turn(
+                session=session,
+                number=session.turns,
+                origin=origin,
+                user="" if proactive else (event.get_message_outline() or "")[-1800:],
+                persona=self.get_persona(event, request)[-12000:],
+                persona_id=event.get_extra("_trace_persona_id") or "",
+                recent=recent_dialogue(request),
+                kind="主动发言" if proactive else "聊天回复",
+            ),
+        )
+
+    @filter.on_llm_response(priority=-200)
+    async def remember_reply(self, event: AstrMessageEvent, response):
+        turn = event.get_extra(TURN)
+        if (
+            turn
+            and getattr(response, "role", "") == "assistant"
+            and not getattr(response, "tools_call_args", None)
+        ):
+            turn.reply = (getattr(response, "completion_text", None) or "").strip()[-3500:]
+
+    @filter.on_agent_done(priority=-200)
+    async def agent_done(self, event: AstrMessageEvent, run_context, response):
+        await self.remember_reply(event, response)
+
+    @filter.after_message_sent(priority=-200)
+    async def after_reply(self, event: AstrMessageEvent):
+        result = event.get_result()
+        if result and result.result_content_type == ResultContentType.LLM_RESULT and event._has_send_oper:
+            await self.schedule_expression(event, (result.get_plain_text() or "").strip())
+
+    @filter.on_decorating_result(priority=-200)
+    async def stream_finished(self, event: AstrMessageEvent):
+        # On 4.29 native streams have already been delivered at STREAMING_FINISH.
+        result = event.get_result()
+        if result and result.result_content_type == ResultContentType.STREAMING_FINISH and event._has_send_oper:
+            await self.schedule_expression(event, (result.get_plain_text() or "").strip())
+
+    def current(self, turn):
+        return (
+            not self.closing
+            and self.config.get("enabled", True)
+            and self.sessions.get(turn.origin) is turn.session
+            and turn.session.turns == turn.number
+            and self.enabled_in(turn.origin)
+        )
+
+    async def schedule_expression(self, event, delivered_text):
+        turn = event.get_extra(TURN)
+        if not turn or turn.scheduled or not self.current(turn):
+            return
+        turn.reply = (delivered_text or turn.reply)[-3500:]
+        if not turn.reply or not self.library.available():
+            return
+        turn.scheduled = True
+        task = asyncio.create_task(self.express(event, turn))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        # These request-scoped adapters close delivery when their pipeline exits.
+        if event.get_platform_name() in {"webchat", "wecom_ai_bot"}:
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def express(self, event, turn):
+        try:
+            if not self.current(turn):
+                return
+            candidates = shortlist(self.library.available(), turn.user + "\n" + turn.reply, turn.number)
+            if not candidates:
+                return
+            mood = self.linked("short_term_mood", turn.origin)
+            cognition = self.linked("self_cognition", turn.origin)
+            recent_stickers = [
+                {"turns_ago": turn.number - number, "seconds_ago": int(time.monotonic() - sent), "image": label}
+                for number, sent, label, persona_id in turn.session.history
+                if persona_id == turn.persona_id
+            ]
+            max_images = max(1, min(20, int(self.config.get("burst_limit", 6))))
+            scene = {
+                "人格": turn.persona,
+                "额外表情习惯": self.config.get("expression_style", ""),
+                "场景": turn.kind,
+                "最近对话": turn.recent,
+                "对方这句话": turn.user,
+                "已经发出的回复": turn.reply,
+                "已发表情": recent_stickers,
+                "当前情绪": mood,
+                "长期表达习惯": {key: cognition[key] for key in ("character", "people") if key in cognition},
+                "本组可用图片数上限": max_images,
+                "候选图片": [item.summary() for item in candidates],
+            }
+            provider = self.config.get(
+                "expression_provider_id"
+            ) or await self.context.get_current_chat_provider_id(turn.origin)
+            reply = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider,
+                    system_prompt=EXPRESSION_PROMPT,
+                    prompt=json.dumps(scene, ensure_ascii=False),
+                ),
+                timeout=15,
+            )
+            ids = selected_ids(reply.completion_text, candidates, max_images)
+            for index, ident in enumerate(ids):
+                if index:
+                    await asyncio.sleep(0.45)
+                if not self.current(turn):
+                    break
+                item = self.library.items.get(ident)
+                if not item or not item.enabled or not item.description or not self.library.path(item).is_file():
+                    continue
+                await asyncio.wait_for(
+                    event.send(
+                        MessageChain([Image.fromFileSystem(str(self.library.path(item)))]),
+                    ),
+                    timeout=8,
+                )
+                turn.session.history.append((turn.number, time.monotonic(), item.description, turn.persona_id))
+        except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
+            logger.warning("主动表情发送跳过 (%s)", type(error).__name__)
+
+    def vision_provider(self):
+        if provider := self.config.get("vision_provider_id"):
+            return provider
+        providers = self.context.get_all_providers()
+        for provider in providers:
+            if "image" in (provider.provider_config.get("modalities") or []):
+                return provider.meta().id
+        return ""
+
+    def queue_index(self, items):
+        for item in items:
+            if item.id not in self.pending:
+                self.index_errors.pop(item.id, None)
+                self.pending[item.id] = item
+        if self.pending and not self.closing and (self.worker is None or self.worker.done()):
+            self.worker = asyncio.create_task(self.index_images())
+
+    async def index_images(self):
+        while self.pending:
+            ident, item = next(iter(self.pending.items()))
+            try:
+                if self.library.items.get(ident) is not item:
+                    continue
+                provider = self.vision_provider()
+                if not provider:
+                    self.index_errors[ident] = "请在插件配置选择支持图片输入的识图模型，然后重试"
+                    continue
+                data = await asyncio.to_thread(vision_image, self.library.path(item))
+                with tempfile.TemporaryDirectory(prefix="active-sticker-") as folder:
+                    preview = Path(folder) / "frames.png"
+                    await asyncio.to_thread(preview.write_bytes, data)
+                    result = await asyncio.wait_for(
+                        self.context.llm_generate(
+                            chat_provider_id=provider,
+                            prompt=VISION_PROMPT,
+                            image_urls=[str(preview)],
+                        ),
+                        timeout=60,
+                    )
+                values = fields(object_response(result.completion_text))
+                if not values["description"]:
+                    self.index_errors[ident] = "模型没有返回有效描述，可重试或手动填写"
+                else:
+                    self.library.update(item, **values)
+            except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
+                if self.library.items.get(ident) is item:
+                    self.index_errors[ident] = f"识图失败（{type(error).__name__}），可重试或手动填写"
+            finally:
+                self.pending.pop(ident, None)
+
+    async def web_library(self):
+        return json_response(
+            {
+                "items": [
+                    {
+                        **asdict(item),
+                        "pending": item.id in self.pending,
+                        "error": self.index_errors.get(item.id, ""),
+                        "missing": not self.library.path(item).is_file(),
+                    }
+                    for item in self.library.items.values()
+                ],
+                "vision_configured": bool(self.vision_provider()),
+            }
+        )
+
+    async def web_preview(self):
+        item = self.library.items.get(request.query.get("id", ""))
+        if not item or not self.library.path(item).is_file():
+            return error_response("找不到图片", status_code=404)
+        try:
+            preview = await asyncio.to_thread(preview_data, self.library.path(item))
+        except (OSError, ValueError):
+            return error_response("无法预览这张图片", status_code=422)
+        return json_response({"src": preview})
+
+    async def web_upload(self):
+        upload = (await request.files()).get("file")
+        if not isinstance(upload, PluginUploadFile):
+            return error_response("请选择图片", status_code=400)
+        try:
+            data = await upload.read(MAX_BYTES + 1)
+            inspected = await asyncio.to_thread(inspect_image, data)
+        except ValueError as error:
+            return error_response(str(error), status_code=400)
+        item, added = self.library.add(upload.filename or "", data, inspected)
+        if item.enabled and not item.description:
+            self.queue_index([item])
+        return json_response({"id": item.id, "added": added})
+
+    async def web_edit(self):
+        data = await request.json(default={})
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            return error_response("缺少图片 ID", status_code=400)
+        item = self.library.items.get(data["id"])
+        if not item:
+            return error_response("找不到图片", status_code=404)
+        if not isinstance(data.get("enabled"), bool):
+            return error_response("缺少启用状态", status_code=400)
+        self.library.update(item, **fields(data), enabled=data["enabled"])
+        self.index_errors.pop(item.id, None)
+        return json_response({"saved": True})
+
+    async def web_delete(self):
+        data = await request.json(default={})
+        item = (
+            self.library.items.get(data["id"])
+            if isinstance(data, dict) and isinstance(data.get("id"), str)
+            else None
+        )
+        if not item:
+            return error_response("找不到图片", status_code=404)
+        self.library.delete(item)
+        self.index_errors.pop(item.id, None)
+        return json_response({"deleted": True})
+
+    async def web_index(self):
+        data = await request.json(default={})
+        if not isinstance(data, dict):
+            return error_response("无效的识图请求", status_code=400)
+        ident = data.get("id")
+        if isinstance(ident, str):
+            item = self.library.items.get(ident)
+            if not item:
+                return error_response("找不到图片", status_code=404)
+            items = [item]
+        else:
+            items = [
+                item
+                for item in self.library.items.values()
+                if item.enabled and not item.description and self.library.path(item).is_file()
+            ]
+        if not self.vision_provider():
+            return error_response("请先在插件配置选择识图模型", status_code=400)
+        self.queue_index(items)
+        return json_response({"queued": len(items)})
+
+    async def web_catalog(self):
+        return file_response(self.library.root / "catalog.md", filename="catalog.md", content_type="text/markdown")

@@ -1,0 +1,50 @@
+{
+  "enabled": {
+    "description": "启用自动表情",
+    "type": "bool",
+    "default": true
+  },
+  "expression_provider_id": {
+    "description": "表情判断模型",
+    "hint": "留空跟随本会话的 AstrBot 聊天模型。建议使用响应快的模型。",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "vision_provider_id": {
+    "description": "识图模型",
+    "hint": "请选择支持图片输入的模型。留空会尝试查找已声明图片能力的模型。",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "expression_style": {
+    "description": "补充表情习惯",
+    "hint": "用自然语言描述，比如「熟了会接梗，笑到停不下来时会贴图刷屏」。留空跟随人格。",
+    "type": "text",
+    "default": ""
+  },
+  "burst_limit": {
+    "description": "单次可连发张数上限",
+    "hint": "实际发几张由人格和场景决定；设为 1 可只发单张。",
+    "type": "int",
+    "default": 6,
+    "min": 1,
+    "max": 20
+  },
+  "interop_enabled": {
+    "description": "启用可选联动",
+    "type": "bool",
+    "default": true
+  },
+  "link_short_term_mood": {
+    "description": "联动短期共享情绪",
+    "type": "bool",
+    "default": true
+  },
+  "link_self_cognition": {
+    "description": "联动自主认知",
+    "type": "bool",
+    "default": true
+  }
+}
