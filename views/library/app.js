@@ -56,6 +56,7 @@ const observer = new IntersectionObserver((entries) => {
 
 function openItem(item) {
   selection = item;
+  $("delete-confirmation").hidden = true;
   $("image-name").textContent = item.name;
   $("description").value = item.description;
   $("usage").value = item.use_when;
@@ -173,8 +174,7 @@ for (const id of ["search", "status"]) {
 }
 $("more").addEventListener("click", () => { visible += 30; render(); });
 $("close").addEventListener("click", () => editor.close());
-$("edit-form").addEventListener("submit", (event) => {
-  event.preventDefault();
+$("save").addEventListener("click", () => {
   action(() => updateItem("edit", {
     description: $("description").value,
     use_when: $("usage").value,
@@ -184,10 +184,14 @@ $("edit-form").addEventListener("submit", (event) => {
 });
 $("identify").addEventListener("click", () => action(() => updateItem("index"), $("edit-error")));
 $("delete").addEventListener("click", () => {
-  if (window.confirm("删除「" + selection.name + "」及其描述？")) {
-    action(() => updateItem("delete"), $("edit-error"));
-  }
+  $("delete-confirmation").hidden = false;
+  $("cancel-delete").focus();
 });
+$("cancel-delete").addEventListener("click", () => {
+  $("delete-confirmation").hidden = true;
+  $("delete").focus();
+});
+$("confirm-delete").addEventListener("click", () => action(() => updateItem("delete"), $("edit-error")));
 $("retry").addEventListener("click", () => action(async () => {
   const result = await bridge.apiPost("index", {});
   report(result.queued + " 张图片已加入识图队列");
