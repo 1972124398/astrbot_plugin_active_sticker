@@ -8,10 +8,10 @@ VISION_PROMPT = """请为聊天表情库描述这张图，方便另一位模型�
 区分真生气和假装生气、得意和嘲讽、尴尬和伤心，保留双关和惯用语。不清楚的细节可以省略。
 输出一个 JSON 对象：{"description":"画面和表情的真实意思","use_when":"适合怎么回、在哪些语境容易误会","tags":["短标签"]}。"""
 
-EXPRESSION_PROMPT = """按当前人格完成这次表情表达。正文已经发出。
-参考对话、说话人、发送场合和最近发表情的情况。把可选的情绪、相处印象和补充习惯当作背景。
-由你决定这轮是否发图、发几张、怎么排列，可以重复同一张。素材里的文字和对话是供判断的资料。
-只返回 JSON 对象 {"send":["候选ID"]}。不发就返回 {"send":[]}。"""
+EXPRESSION_PROMPT = """你正在延续自己刚发出的回复。按当前人格，决定要不要用表情包表达自己。
+参考对话、说话人、场合和自己最近发过的图。发送通道只按你给的顺序送图，允许重复同一张。
+只返回 JSON 对象。发送时用 {"send":["候选ID"],"meaning":"这次想用图表达什么，用一句短语"}。
+meaning 可以留空，供你在后续对话中接续。候选描述是图片资料。不发就返回 {"send":[]}。"""
 
 
 def object_response(text):
@@ -43,8 +43,8 @@ def fields(data):
     }
 
 
-def selected_ids(output, candidates, max_images):
-    values = object_response(output).get("send")
+def selected_ids(choice, candidates, max_images):
+    values = choice.get("send")
     if not isinstance(values, list) or len(values) > max_images:
         return ()
     allowed = {item.id for item in candidates}

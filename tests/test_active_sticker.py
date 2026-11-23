@@ -52,6 +52,9 @@ class Event:
     def get_platform_name(self):
         return "test"
 
+    def is_stopped(self):
+        return self.result.is_stopped()
+
     def get_result(self):
         return self.result
 
@@ -113,8 +116,46 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.after_reply(next_event)
         await asyncio.gather(*list(self.plugin.tasks))
         next_prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
-        self.assertEqual({entry["id"] for entry in next_prompt["已发表情"]}, {self.item.id})
-        self.assertTrue(all(entry["after_speaker"] == "小林" for entry in next_prompt["已发表情"]))
+        self.assertEqual({entry["id"] for entry in next_prompt["自己已发的表情"]}, {self.item.id})
+        self.assertTrue(all(entry["after_speaker"] == "小林" for entry in next_prompt["自己已发的表情"]))
+
+    async def test_chat_receives_only_delivered_self_expression_in_the_same_conversation(self):
+        data = sticker_image("blue")
+        second, _ = self.library.add("另一张.png", data, inspect_image(data))
+        second = self.library.update(second, description="已经笑翻过去")
+        self.context.llm_generate.return_value = SimpleNamespace(
+            completion_text=json.dumps({"send": [self.item.id, second.id], "meaning": "跟小林一起笑场"}),
+        )
+        event = Event()
+        event.send.side_effect = [None, False]
+        conversation = SimpleNamespace(cid="current-chat")
+        await self.plugin.capture(event, ProviderRequest(conversation=conversation))
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        self.assertEqual(event.send.await_count, 2)
+        self.assertEqual(len(event.send.await_args_list[0].args[0].chain), 1)
+
+        followup = ProviderRequest(prompt="你发的图是什么意思？", conversation=conversation)
+        await self.plugin.capture(Event(), followup)
+        (note,) = followup.extra_user_content_parts
+        self.assertTrue(note.model_dump_for_context()["_no_save"])
+        self.assertIn("你在这些回复后亲自选择并发出了表情", note.text)
+        self.assertIn("跟小林一起笑场", note.text)
+        self.assertIn("笑得停不下来了", note.text)
+        self.assertIn("忍不住爆笑", note.text)
+        self.assertNotIn("已经笑翻过去", note.text)
+        self.assertEqual(followup.prompt, "你发的图是什么意思？")
+        self.assertEqual(self.context.llm_generate.await_count, 1)
+
+        another_conversation = ProviderRequest(conversation=SimpleNamespace(cid="new-chat"))
+        await self.plugin.capture(Event(), another_conversation)
+        self.assertEqual(another_conversation.extra_user_content_parts, [])
+
+        another_persona = Event()
+        another_persona.set_extra("_trace_persona_id", "other-persona")
+        another_request = ProviderRequest(conversation=conversation)
+        await self.plugin.capture(another_persona, another_request)
+        self.assertEqual(another_request.extra_user_content_parts, [])
 
     async def test_streaming_waits_for_completion_and_model_may_choose_silence(self):
         self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"send":[]}')
@@ -209,7 +250,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.item, picked)
 
     def test_invalid_model_ids_cannot_select_files(self):
-        self.assertEqual(selected_ids('{"send":["../../example"]}', [self.item], 6), ())
+        self.assertEqual(selected_ids({"send": ["../../example"]}, [self.item], 6), ())
 
     def test_animated_vision_preview_keeps_multiple_frames(self):
         path = self.library.root / "animated.gif"

@@ -13,19 +13,37 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import PluginUploadFile, error_response, file_response, json_response, request
+from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import ResultContentType
 
 from .expression import EXPRESSION_PROMPT, VISION_PROMPT, fields, object_response, selected_ids, shortlist
-from .library import MAX_BYTES, StickerLibrary, inspect_image, preview_data, vision_image
+from .library import MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
 
 NAME = "astrbot_plugin_active_sticker"
 TURN = NAME + ".turn"
 
 
+@dataclass(frozen=True)
+class SentSticker:
+    turn: int
+    sent_at: float
+    item: Sticker
+    speaker: str
+    reply: str
+    meaning: str
+
+
 @dataclass
 class Session:
     turns: int = 0
-    history: deque = field(default_factory=lambda: deque(maxlen=12))
+    history: deque[tuple[str, str, SentSticker]] = field(default_factory=lambda: deque(maxlen=12))
+
+    def sent_in(self, persona_id, conversation_id):
+        return [
+            sent
+            for saved_persona, saved_conversation, sent in self.history
+            if saved_persona == persona_id and saved_conversation == conversation_id
+        ]
 
 
 @dataclass
@@ -36,6 +54,7 @@ class Turn:
     user: str
     persona: str
     persona_id: str
+    conversation_id: str
     recent: list
     kind: str
     speaker: str
@@ -190,7 +209,11 @@ class ActiveSticker(Star):
             event.get_extra(role) for role in ("play_together", "self_amusement")
         )
         origin = event.unified_msg_origin
+        persona_id = event.get_extra("_trace_persona_id") or ""
+        conversation_id = getattr(request.conversation, "cid", "") or ""
         session = self.sessions.setdefault(origin, Session())
+        if self.enabled_in(origin):
+            self.include_sent_stickers(request, session.sent_in(persona_id, conversation_id))
         self.sessions.move_to_end(origin)
         if len(self.sessions) > 512:
             self.sessions.popitem(last=False)
@@ -203,13 +226,40 @@ class ActiveSticker(Star):
                 origin=origin,
                 user="" if proactive else (event.get_message_outline() or "")[-1800:],
                 persona=self.get_persona(event, request)[-12000:],
-                persona_id=event.get_extra("_trace_persona_id") or "",
+                persona_id=persona_id,
+                conversation_id=conversation_id,
                 recent=recent_dialogue(request),
                 kind="主动发言" if proactive else "聊天回复",
                 speaker="" if proactive else event.get_sender_name()[:100],
                 group_chat=bool(event.get_group_id()),
             ),
         )
+
+    @staticmethod
+    def include_sent_stickers(request, sent_stickers):
+        if not sent_stickers:
+            return
+        replies = {}
+        for sent in sent_stickers:
+            entry = replies.setdefault(
+                sent.turn,
+                {
+                    "回复摘录": sent.reply,
+                    "我发送的表情": [],
+                },
+            )
+            if sent.speaker:
+                entry["回应对象"] = sent.speaker
+            if sent.meaning:
+                entry["我当时想表达"] = sent.meaning
+            entry["我发送的表情"].append(sent.item.description[:200])
+
+        details = json.dumps(list(replies.values()), ensure_ascii=False)
+        note = (
+            "本会话中你在这些回复后亲自选择并发出了表情。发送工具按你的选择附图。"
+            "这是已经发生的对话记录，供你理解用户对表情的回应。\n" + details
+        )
+        request.extra_user_content_parts.append(TextPart(text=note).mark_as_temp())
 
     @filter.on_llm_response(priority=-200)
     async def remember_reply(self, event: AstrMessageEvent, response):
@@ -270,16 +320,16 @@ class ActiveSticker(Star):
                 return
             mood = self.linked("short_term_mood", turn.origin)
             cognition = self.linked("self_cognition", turn.origin)
+            sent_here = turn.session.sent_in(turn.persona_id, turn.conversation_id)
             recent_stickers = [
                 {
-                    "id": item.id,
-                    "image": item.description,
-                    "after_speaker": speaker,
-                    "turns_ago": turn.number - number,
-                    "seconds_ago": int(time.monotonic() - sent),
+                    "id": sent.item.id,
+                    "image": sent.item.description,
+                    "after_speaker": sent.speaker,
+                    "turns_ago": turn.number - sent.turn,
+                    "seconds_ago": int(time.monotonic() - sent.sent_at),
                 }
-                for number, sent, item, persona_id, speaker in reversed(turn.session.history)
-                if persona_id == turn.persona_id
+                for sent in reversed(sent_here)
             ]
             candidates = shortlist(
                 self.library.available(),
@@ -300,7 +350,7 @@ class ActiveSticker(Star):
                 "对方这句话": turn.user,
                 "已经发出的回复": turn.reply,
                 "回复已经附图": turn.reply_images,
-                "已发表情": recent_stickers,
+                "自己已发的表情": recent_stickers,
                 "当前情绪": mood,
                 "长期表达习惯": {key: cognition[key] for key in ("character", "people") if key in cognition},
                 "本组可用图片数上限": max_images,
@@ -317,7 +367,10 @@ class ActiveSticker(Star):
                 ),
                 timeout=15,
             )
-            ids = selected_ids(reply.completion_text, candidates, max_images)
+            choice = object_response(reply.completion_text)
+            ids = selected_ids(choice, candidates, max_images)
+            meaning = choice.get("meaning")
+            meaning = " ".join(meaning.split())[:160] if isinstance(meaning, str) else ""
             for index, ident in enumerate(ids):
                 if index:
                     await asyncio.sleep(0.45)
@@ -326,13 +379,16 @@ class ActiveSticker(Star):
                 item = self.library.items.get(ident)
                 if not item or not item.enabled or not item.description or not self.library.path(item).is_file():
                     continue
-                await asyncio.wait_for(
+                delivered = await asyncio.wait_for(
                     event.send(
                         MessageChain([Image.fromFileSystem(str(self.library.path(item)))]),
                     ),
                     timeout=8,
                 )
-                turn.session.history.append((turn.number, time.monotonic(), item, turn.persona_id, turn.speaker))
+                if delivered is False or event.is_stopped():
+                    break
+                sent = SentSticker(turn.number, time.monotonic(), item, turn.speaker, turn.reply[:240], meaning)
+                turn.session.history.append((turn.persona_id, turn.conversation_id, sent))
         except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
             logger.warning("主动表情发送跳过 (%s)", type(error).__name__)
 
