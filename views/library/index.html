@@ -3,39 +3,91 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>表情库</title>
+  <title>主动表情面板</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
 <main>
-  <header>
-    <div>
-      <h1>表情库</h1>
-      <p id="counts" class="muted" aria-live="polite">正在读取表情库…</p>
-    </div>
-    <div class="actions">
-      <button id="export" type="button">下载描述目录</button>
-      <button id="retry" type="button">识别待处理图片</button>
+  <header class="panel-header">
+    <h1>主动表情</h1>
+    <div class="tabs" role="tablist" aria-label="主动表情">
+      <button id="library-tab" type="button" role="tab" aria-selected="true" aria-controls="library-panel">表情库</button>
+      <button id="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel" tabindex="-1">设置</button>
     </div>
   </header>
-  <button id="drop" type="button">
-    <strong>导入表情包</strong>
-    <span>拖入图片或点击批量选择 · PNG、JPEG、GIF、WebP</span>
-  </button>
-  <input id="files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
-  <p id="notice" class="notice" role="status" hidden></p>
-  <section class="toolbar" aria-label="筛选表情">
-    <input id="search" type="search" placeholder="搜索文件名、描述或标签" aria-label="搜索表情">
-    <select id="status" aria-label="按状态筛选">
-      <option value="">全部状态</option>
-      <option value="ready">可使用</option>
-      <option value="waiting">待识图</option>
-      <option value="disabled">已停用</option>
-    </select>
+  <section id="library-panel" role="tabpanel" aria-labelledby="library-tab">
+    <header class="library-header">
+      <div>
+        <p id="counts" class="muted" aria-live="polite">正在读取表情库…</p>
+      </div>
+      <div class="actions">
+        <button id="export" type="button">下载描述目录</button>
+        <button id="retry" type="button">识别待处理图片</button>
+      </div>
+    </header>
+    <div id="vision-hint" class="vision-hint" hidden>
+      <span>配置识图模型后，新导入的图片会自动生成描述。</span>
+      <button id="open-settings" type="button">前往设置</button>
+    </div>
+    <button id="drop" type="button">
+      <strong>导入表情包</strong>
+      <span>拖入图片或点击批量选择 · PNG、JPEG、GIF、WebP</span>
+    </button>
+    <input id="files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+    <p id="notice" class="notice" role="status" hidden></p>
+    <section class="toolbar" aria-label="筛选表情">
+      <input id="search" type="search" placeholder="搜索文件名、描述或标签" aria-label="搜索表情">
+      <select id="status" aria-label="按状态筛选">
+        <option value="">全部状态</option>
+        <option value="ready">可使用</option>
+        <option value="waiting">待识图</option>
+        <option value="disabled">已停用</option>
+      </select>
+    </section>
+    <div id="gallery" class="gallery"></div>
+    <p id="empty" class="empty" hidden></p>
+    <button id="more" type="button" hidden>显示更多</button>
   </section>
-  <div id="gallery" class="gallery"></div>
-  <p id="empty" class="empty" hidden></p>
-  <button id="more" type="button" hidden>显示更多</button>
+  <section id="settings-panel" class="settings" role="tabpanel" aria-labelledby="settings-tab" hidden>
+    <div id="settings-fields" hidden>
+      <fieldset>
+        <legend>模型</legend>
+        <div class="model-fields">
+          <label>识图模型
+            <select id="vision_provider_id" aria-describedby="vision-help"></select>
+            <small id="vision-help">用于建库，选择支持图片输入的模型。</small>
+          </label>
+          <label>表情判断模型
+            <select id="expression_provider_id"></select>
+            <small>用于决定何时发表情以及发哪张。</small>
+          </label>
+        </div>
+        <p id="provider-note" class="muted" hidden>请先在 AstrBot 添加聊天模型，再回来选择。</p>
+      </fieldset>
+      <fieldset>
+        <legend>表情习惯</legend>
+        <label class="check"><input id="auto-enabled" type="checkbox">启用自动表情</label>
+        <label>补充表情习惯
+          <textarea id="expression_style" rows="3" placeholder="例如，和熟人笑场时会连发几张。"></textarea>
+        </label>
+        <label class="burst-setting">单次连发上限
+          <input id="burst_limit" type="number" min="1" max="20" step="1" required aria-describedby="burst-help">
+          <small id="burst-help">实际发几张由人格和聊天场景决定。</small>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>可选联动</legend>
+        <label class="check"><input id="interop_enabled" type="checkbox">启用插件联动</label>
+        <label class="check peer-toggle"><input id="link_short_term_mood" type="checkbox">短期共享情绪</label>
+        <label class="check peer-toggle"><input id="link_self_cognition" type="checkbox">自主认知</label>
+      </fieldset>
+    </div>
+    <div class="settings-footer">
+      <p id="settings-status" role="status" aria-live="polite"></p>
+      <button id="settings-retry" type="button" hidden>重试读取</button>
+      <button id="settings-save" type="button" class="primary" disabled>保存设置</button>
+    </div>
+  </section>
 </main>
 <dialog id="editor">
   <div id="edit-form">

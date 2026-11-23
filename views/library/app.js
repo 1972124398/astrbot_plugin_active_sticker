@@ -106,9 +106,7 @@ async function refresh() {
     const changed = JSON.stringify(snapshot.items) !== JSON.stringify(items);
     items = snapshot.items;
     if (changed || gallery.childElementCount === 0) render();
-    if (!snapshot.vision_configured && !importing && $("notice").hidden) {
-      report("自动识图需要在插件配置中选择可读取图片的模型。也可手动填写描述。");
-    }
+    $("vision-hint").hidden = snapshot.vision_configured;
     if (items.some((item) => item.pending) || importing) timer = window.setTimeout(refresh, 1800);
   } catch (error) {
     if (generation === refreshGeneration) report(error.message);
@@ -198,6 +196,120 @@ $("retry").addEventListener("click", () => action(async () => {
   await refresh();
 }));
 $("export").addEventListener("click", () => action(() => bridge.download("catalog", {}, "catalog.md")));
+
+const settingInputs = {
+  enabled: $("auto-enabled"),
+  vision_provider_id: $("vision_provider_id"),
+  expression_provider_id: $("expression_provider_id"),
+  expression_style: $("expression_style"),
+  burst_limit: $("burst_limit"),
+  interop_enabled: $("interop_enabled"),
+  link_short_term_mood: $("link_short_term_mood"),
+  link_self_cognition: $("link_self_cognition"),
+};
+const tabs = [$("library-tab"), $("settings-tab")];
+let savedSettings;
+let loadingSettings = false;
+
+function providerOptions(input, providers, selected, fallback) {
+  input.replaceChildren(new Option(fallback, ""));
+  for (const { id, model, vision } of providers) {
+    const label = model && model !== id ? id + " · " + model : id;
+    const marked = input === settingInputs.vision_provider_id && vision ? label + "（支持图片）" : label;
+    input.add(new Option(marked, id));
+  }
+  if (selected && !providers.some(({ id }) => id === selected)) {
+    input.add(new Option(selected + "（当前不可用）", selected));
+  }
+  input.value = selected || "";
+}
+
+function updateLinkToggles() {
+  for (const input of [settingInputs.link_short_term_mood, settingInputs.link_self_cognition]) {
+    input.disabled = !settingInputs.interop_enabled.checked;
+  }
+}
+
+async function loadSettings() {
+  if (loadingSettings) return;
+  loadingSettings = true;
+  $("settings-retry").hidden = true;
+  $("settings-status").textContent = "正在读取设置…";
+  try {
+    const { values, providers } = await bridge.apiGet("settings");
+    providerOptions(settingInputs.vision_provider_id, providers, values.vision_provider_id, "自动选择支持图片的模型");
+    providerOptions(settingInputs.expression_provider_id, providers, values.expression_provider_id, "跟随会话模型");
+    for (const [key, input] of Object.entries(settingInputs)) {
+      if (input.type === "checkbox") input.checked = values[key];
+      else input.value = values[key];
+    }
+    $("provider-note").hidden = providers.length > 0;
+    updateLinkToggles();
+    savedSettings = values;
+    $("settings-fields").hidden = false;
+    $("settings-save").disabled = false;
+    $("settings-status").textContent = "";
+  } catch (error) {
+    $("settings-status").textContent = error.message;
+    $("settings-retry").hidden = false;
+  } finally {
+    loadingSettings = false;
+  }
+}
+
+function showTab(selected) {
+  for (const tab of tabs) {
+    const active = tab === selected;
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+    $(tab.getAttribute("aria-controls")).hidden = !active;
+  }
+  if (selected === $("settings-tab") && !savedSettings) void loadSettings();
+}
+
+async function saveSettings() {
+  if (!savedSettings || !settingInputs.burst_limit.reportValidity()) return;
+  const changed = {};
+  for (const [key, input] of Object.entries(settingInputs)) {
+    let value = input.value;
+    if (input.type === "checkbox") value = input.checked;
+    if (input.type === "number") value = input.valueAsNumber;
+    if (value !== savedSettings[key]) changed[key] = value;
+  }
+  const button = $("settings-save");
+  button.disabled = true;
+  $("settings-status").textContent = "正在保存…";
+  try {
+    await bridge.apiPost("settings/save", changed);
+    Object.assign(savedSettings, changed);
+    $("settings-status").textContent = "设置已保存";
+    if ("vision_provider_id" in changed) void refresh();
+  } catch (error) {
+    $("settings-status").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+for (const tab of tabs) {
+  tab.addEventListener("click", () => showTab(tab));
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[1] : tabs.find((entry) => entry !== tab);
+    showTab(next);
+    next.focus();
+  });
+}
+$("open-settings").addEventListener("click", () => {
+  showTab($("settings-tab"));
+  $("settings-tab").focus();
+});
+settingInputs.interop_enabled.addEventListener("change", updateLinkToggles);
+$("settings-fields").addEventListener("input", () => { $("settings-status").textContent = ""; });
+$("settings-retry").addEventListener("click", loadSettings);
+$("settings-save").addEventListener("click", saveSettings);
+
 
 function updateTheme(context) {
   document.documentElement.dataset.dark = String(Boolean(context.isDark));

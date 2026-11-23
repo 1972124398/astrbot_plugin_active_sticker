@@ -74,6 +74,8 @@ class ActiveSticker(Star):
         self.tasks = set()
         self.closing = False
         for route, handler, method in (
+            ("settings", self.web_settings, "GET"),
+            ("settings/save", self.web_save_settings, "POST"),
             ("library", self.web_library, "GET"),
             ("preview", self.web_preview, "GET"),
             ("upload", self.web_upload, "POST"),
@@ -82,7 +84,7 @@ class ActiveSticker(Star):
             ("index", self.web_index, "POST"),
             ("catalog", self.web_catalog, "GET"),
         ):
-            context.register_web_api(f"/{NAME}/{route}", handler, [method], "主动表情库")
+            context.register_web_api(f"/{NAME}/{route}", handler, [method], "主动表情面板")
 
     async def initialize(self):
         self.queue_index(item for item in self.library.items.values() if item.enabled and not item.description)
@@ -358,6 +360,46 @@ class ActiveSticker(Star):
                     self.index_errors[ident] = f"识图失败（{type(error).__name__}），可重试或手动填写"
             finally:
                 self.pending.pop(ident, None)
+
+    async def web_settings(self):
+        providers = []
+        for provider in self.context.get_all_providers():
+            meta = provider.meta()
+            providers.append(
+                {
+                    "id": meta.id,
+                    "model": meta.model,
+                    "vision": "image" in (provider.provider_config.get("modalities") or []),
+                }
+            )
+        values = {key: self.config.get(key, spec["default"]) for key, spec in self.config.schema.items()}
+        return json_response({"values": values, "providers": providers})
+
+    async def web_save_settings(self):
+        values = await request.json(default=None)
+        if not isinstance(values, dict) or not self.config.schema.keys() >= values.keys():
+            return error_response("配置字段无效", status_code=400)
+        for key, value in values.items():
+            spec = self.config.schema[key]
+            kind = spec["type"]
+            valid = (
+                (kind == "bool" and type(value) is bool)
+                or (kind in {"string", "text"} and isinstance(value, str))
+                or (kind == "int" and type(value) is int and spec["min"] <= value <= spec["max"])
+            )
+            if not valid:
+                return error_response(f"{spec['description']}填写有误", status_code=400)
+
+        if values:
+            previous = dict(self.config)
+            try:
+                self.config.save_config(values)
+            except OSError:
+                self.config.clear()
+                self.config.update(previous)
+                logger.exception("主动表情保存配置失败")
+                return error_response("配置保存失败，请重试", status_code=500)
+        return json_response({"saved": True})
 
     async def web_library(self):
         return json_response(

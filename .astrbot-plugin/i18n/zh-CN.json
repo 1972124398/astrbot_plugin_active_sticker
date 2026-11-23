@@ -1,8 +1,8 @@
 {
   "views": {
     "library": {
-      "title": "表情库",
-      "description": "导入、识别和管理表情包"
+      "title": "主动表情面板",
+      "description": "管理表情库、模型和联动设置"
     }
   }
 }
