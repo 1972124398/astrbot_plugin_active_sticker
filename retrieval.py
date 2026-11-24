@@ -13,7 +13,7 @@ CATEGORIES = {
     "亲近": "亲亲 抱抱 撒娇 卖萌 贴贴 爱心 喜欢 可爱 hug love",
     "调侃": "调侃 嘲讽 阴阳 搞怪 整活 坏笑 接梗 逗 joke tease",
     "回应": "点头 摇头 同意 拒绝 收到 确认 谢谢 对不起 好的 OK yes no",
-    "日常": "早安 晚安 睡觉 吃饭 工作 上班 加油 拜拜 再见 morning sleep",
+    "日常": "早安 晚安 睡觉 想睡 困困 打哈欠 吃饭 工作 上班 加油 拜拜 再见 打招呼 挥手 morning sleep",
     "其他": "",
 }
 
@@ -38,7 +38,7 @@ def terms(value):
 def inferred_categories(item):
     if item.categories:
         return item.categories
-    text = " ".join((item.description, item.use_when, " ".join(item.tags))).lower()
+    text = (" ".join(item.tags) if item.tags else item.description).lower()
     return tuple(
         name for name, cues in CATEGORIES.items() if any(cue.lower() in text for cue in cues.split())
     ) or ("其他",)

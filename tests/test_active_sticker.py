@@ -304,6 +304,15 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.item.id, (rebuilt.root / "catalog/开心.md").read_text("utf-8"))
         self.assertNotIn(self.item.id, (rebuilt.root / "library.md").read_text("utf-8"))
 
+    def test_legacy_category_uses_tags_instead_of_negative_usage_examples(self):
+        item = self.library.update(
+            self.item,
+            description="满头问号，不是生气或伤心",
+            tags=("困惑", "问号"),
+            use_when="不适合生气时用，容易误会成撒娇",
+        )
+        self.assertEqual(self.library.search_index.categories[item.id], ("惊讶",))
+
     async def test_successful_expression_survives_a_plugin_reload(self):
         self.expression_model([self.item.id])
         event = Event()
