@@ -12,7 +12,7 @@ from astrbot.api.event import MessageEventResult
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.message.message_event_result import ResultContentType
-from astrbot_plugin_active_sticker.expression import INTENT_PROMPT, selected_ids
+from astrbot_plugin_active_sticker.expression import CHAT_EXPRESSION_PROMPT, INTENT_PROMPT, selected_ids
 from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
 from astrbot_plugin_active_sticker.main import ActiveSticker
 from PIL import Image
@@ -106,6 +106,8 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.capture(event, provider_request)
         self.context.llm_generate.assert_not_called()
         self.assertIn("本地表情库", provider_request.extra_user_content_parts[0].text)
+        self.assertEqual(provider_request.system_prompt, "主对话提示\n\n" + CHAT_EXPRESSION_PROMPT)
+        before["system_prompt"] = provider_request.system_prompt
         before["extra_user_content_parts"] = provider_request.extra_user_content_parts
         await self.plugin.after_reply(event)
         await self.plugin.after_reply(event)
@@ -126,6 +128,57 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         next_prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
         self.assertEqual({entry["id"] for entry in next_prompt["自己已发的表情"]}, {self.item.id})
         self.assertTrue(all(entry["after_speaker"] == "小林" for entry in next_prompt["自己已发的表情"]))
+
+    async def test_priority_is_automatic_per_request_without_changing_character_or_tools(self):
+        event = Event()
+        event.set_extra("_trace_persona_id", None)
+        request = ProviderRequest(prompt="发个表情", system_prompt="话少，偶尔接梗")
+        original_tools = request.func_tool
+        await self.plugin.capture(event, request)
+        self.assertTrue(request.system_prompt.startswith("话少，偶尔接梗\n\n"))
+        self.assertIn(CHAT_EXPRESSION_PROMPT, request.system_prompt)
+        self.assertEqual(event.get_extra("astrbot_plugin_active_sticker.turn").persona, "话少，偶尔接梗")
+        self.assertIs(request.func_tool, original_tools)
+        self.assertEqual(request.prompt, "发个表情")
+        (note,) = request.extra_user_content_parts
+        self.assertTrue(note.model_dump_for_context()["_no_save"])
+        self.assertIn("1 张可用", note.text)
+        await self.plugin.capture(event, request)
+        self.assertEqual(request.system_prompt.count(CHAT_EXPRESSION_PROMPT), 1)
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        fresh = ProviderRequest()
+        await self.plugin.capture(Event(), fresh)
+        self.assertEqual(fresh.system_prompt, CHAT_EXPRESSION_PROMPT)
+        self.context.llm_generate.assert_not_called()
+
+    async def test_priority_is_absent_when_no_images_can_be_sent(self):
+        for changes in ({"enabled": False}, {"description": ""}):
+            with self.subTest(changes=changes):
+                self.library.update(self.library.items[self.item.id], **changes)
+                request = ProviderRequest(system_prompt="原人格")
+                await self.plugin.capture(Event(), request)
+                self.assertEqual(request.system_prompt, "原人格")
+                self.assertFalse(request.extra_user_content_parts)
+                self.library.update(self.library.items[self.item.id], enabled=True, description="忍不住爆笑")
+        self.library.path(self.item).unlink()
+        request = ProviderRequest(system_prompt="原人格")
+        await self.plugin.capture(Event(), request)
+        self.assertEqual(request.system_prompt, "原人格")
+        self.assertFalse(request.extra_user_content_parts)
+
+    async def test_disabled_sessions_and_bridge_events_receive_no_priority(self):
+        for kind in ("disabled", "not_allowed", "bridge"):
+            with self.subTest(kind=kind):
+                self.plugin.config["enabled"] = kind != "disabled"
+                self.context.get_config = lambda **_: {"plugin_set": [] if kind == "not_allowed" else ["*"]}
+                event = Event()
+                if kind == "bridge":
+                    event.set_extra("codex_bridge", True)
+                request = ProviderRequest(system_prompt="原人格")
+                await self.plugin.capture(event, request)
+                self.assertEqual(request.system_prompt, "原人格")
+                self.assertFalse(request.extra_user_content_parts)
+                self.assertIsNone(event.get_extra("astrbot_plugin_active_sticker.turn"))
 
     async def test_chat_receives_only_delivered_self_expression_in_the_same_conversation(self):
         data = sticker_image("blue")

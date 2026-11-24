@@ -16,7 +16,15 @@ from astrbot.api.web import PluginUploadFile, error_response, file_response, jso
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import ResultContentType
 
-from .expression import EXPRESSION_PROMPT, INTENT_PROMPT, VISION_PROMPT, fields, object_response, selected_ids
+from .expression import (
+    CHAT_EXPRESSION_PROMPT,
+    EXPRESSION_PROMPT,
+    INTENT_PROMPT,
+    VISION_PROMPT,
+    fields,
+    object_response,
+    selected_ids,
+)
 from .library import MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
 from .retrieval import CATEGORIES, category_names, inferred_categories
 
@@ -249,11 +257,14 @@ class ActiveSticker(Star):
             event.get_extra(role) for role in ("play_together", "self_amusement")
         )
         origin = event.unified_msg_origin
+        if not self.enabled_in(origin):
+            return
         persona_id = event.get_extra("_trace_persona_id") or ""
         conversation_id = getattr(request.conversation, "cid", "") or ""
+        # Keep the character separate from the request-scoped capability instructions.
+        persona = self.get_persona(event, request)[-12000:]
         session = self.sessions.setdefault(origin, Session())
-        if self.enabled_in(origin):
-            self.include_sent_stickers(request, session.sent_in(persona_id, conversation_id))
+        self.include_sent_stickers(request, session.sent_in(persona_id, conversation_id))
         self.sessions.move_to_end(origin)
         if len(self.sessions) > 512:
             self.sessions.popitem(last=False)
@@ -265,7 +276,7 @@ class ActiveSticker(Star):
                 number=session.turns,
                 origin=origin,
                 user="" if proactive else (event.get_message_outline() or "")[-1800:],
-                persona=self.get_persona(event, request)[-12000:],
+                persona=persona,
                 persona_id=persona_id,
                 conversation_id=conversation_id,
                 recent=recent_dialogue(request),
@@ -279,10 +290,14 @@ class ActiveSticker(Star):
         count = len(self.library.available())
         notes = []
         if count:
+            if CHAT_EXPRESSION_PROMPT not in (request.system_prompt or ""):
+                request.system_prompt = "\n\n".join(
+                    part for part in (request.system_prompt, CHAT_EXPRESSION_PROMPT) if part
+                )
             notes.append(
-                f"你可用的本地表情库有 {count} 张已描述的图片。你可以在回复后继续决定是否想用表情表达自己，"
-                "先确定表达意图，再通过图片检索和发送工具挑合适的图；没有贴切的图可以不发。"
-                "本地表情库和微信原生表情收藏分别管理，原生收藏的查询结果只描述原生收藏。"
+                f"主动表情插件的本地表情库当前有 {count} 张可用且已描述的图片。需要表情包时优先使用这个插件。"
+                "正常回复后会自动进入表情意图判断与检索选图，无需在主对话调用工具。"
+                "微信原生收藏的查询结果只描述原生收藏，不影响这里的可用图片。"
             )
         replies = {}
         for sent in sent_stickers:
