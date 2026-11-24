@@ -12,6 +12,8 @@ from pathlib import Path
 from PIL import Image as PillowImage
 from PIL import ImageOps
 
+from .retrieval import CATEGORIES, CatalogIndex
+
 FORMATS = {"PNG": "png", "JPEG": "jpg", "GIF": "gif", "WEBP": "webp"}
 MAX_BYTES = 16 * 1024 * 1024
 STICKER_ID = re.compile(r"[0-9a-f]{16}")
@@ -28,6 +30,7 @@ class Sticker:
     tags: tuple[str, ...] = ()
     enabled: bool = True
     revision: int = 0
+    categories: tuple[str, ...] = ()
 
     def summary(self):
         return {
@@ -36,6 +39,7 @@ class Sticker:
             "description": self.description,
             "use_when": self.use_when,
             "tags": self.tags,
+            "categories": self.categories,
         }
 
 
@@ -95,6 +99,7 @@ class StickerLibrary:
             rows = json.loads(self.index.read_text(encoding="utf-8"))
             for row in rows:
                 row["tags"] = tuple(row.get("tags", []))
+                row["categories"] = tuple(row.get("categories", []))
                 item = Sticker(**row)
                 if STICKER_ID.fullmatch(item.id) and item.extension in FORMATS.values():
                     self.items[item.id] = item
@@ -165,3 +170,17 @@ class StickerLibrary:
 
     def write_catalog(self):
         self.write(self.root / "catalog.md", self.catalog().encode("utf-8"))
+        self.search_index = CatalogIndex(self.available())
+        documents = self.root / "catalog"
+        documents.mkdir(exist_ok=True)
+        overview = ["# 表情库分类目录", "", "按表达意图检索分类文档中的条目。", ""]
+        for name in CATEGORIES:
+            ids = self.search_index.groups[name]
+            lines = [f"# {name}", ""]
+            for ident in self.items:
+                if ident in ids:
+                    lines.append(json.dumps(self.items[ident].summary(), ensure_ascii=False))
+            self.write(documents / f"{name}.md", "\n".join(lines).encode("utf-8"))
+            if ids:
+                overview.append(f"- [{name}](catalog/{name}.md) · {len(ids)} 张")
+        self.write(self.root / "library.md", "\n".join(overview).encode("utf-8"))

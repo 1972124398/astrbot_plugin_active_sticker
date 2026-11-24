@@ -77,6 +77,7 @@ function openItem(item) {
   $("description").value = item.description;
   $("usage").value = item.use_when;
   $("tags").value = item.tags.join("、");
+  $("categories").value = (item.categories || []).join("、");
   $("enabled").checked = item.enabled;
   $("identify").disabled = item.pending || item.missing || !visionReady;
   report("", $("edit-error"));
@@ -86,9 +87,11 @@ function openItem(item) {
 function render() {
   const query = $("search").value.trim().toLowerCase();
   const state = $("status").value;
+  const category = $("category").value;
   const filtered = items.filter((item) => {
     const haystack = [item.name, item.description, item.use_when, ...item.tags].join(" ").toLowerCase();
-    return (!state || itemStatus(item) === state) && (!query || haystack.includes(query));
+    return (!state || itemStatus(item) === state) && (!query || haystack.includes(query))
+      && (!category || (item.categories || []).includes(category));
   });
   observer.disconnect();
   const cards = filtered.slice(0, visible).map((item) => {
@@ -118,6 +121,12 @@ async function refresh() {
   window.clearTimeout(timer);
   try {
     const snapshot = await bridge.apiGet("library");
+    if (snapshot.categories && $("category").options.length === 1) {
+      for (const name of snapshot.categories) {
+        $("category").add(new Option(name, name));
+        $("category-names").append(new Option(name, name));
+      }
+    }
     if (generation !== refreshGeneration) return;
     const changed = snapshot.vision_configured !== visionReady || JSON.stringify(snapshot.items) !== JSON.stringify(items);
     visionReady = snapshot.vision_configured;
@@ -184,7 +193,7 @@ $("drop").addEventListener("drop", (event) => {
   $("drop").classList.remove("dragging");
   importFiles(event.dataTransfer.files);
 });
-for (const id of ["search", "status"]) {
+for (const id of ["search", "status", "category"]) {
   $(id).addEventListener("input", () => { visible = 30; render(); });
 }
 $("more").addEventListener("click", () => { visible += 30; render(); });
@@ -194,6 +203,7 @@ $("save").addEventListener("click", () => {
     description: $("description").value,
     use_when: $("usage").value,
     tags: $("tags").value,
+    categories: $("categories").value,
     enabled: $("enabled").checked,
   }), $("edit-error"));
 });

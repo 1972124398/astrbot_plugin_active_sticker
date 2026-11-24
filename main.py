@@ -16,8 +16,9 @@ from astrbot.api.web import PluginUploadFile, error_response, file_response, jso
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import ResultContentType
 
-from .expression import EXPRESSION_PROMPT, VISION_PROMPT, fields, object_response, selected_ids, shortlist
+from .expression import EXPRESSION_PROMPT, INTENT_PROMPT, VISION_PROMPT, fields, object_response, selected_ids
 from .library import MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
+from .retrieval import CATEGORIES, category_names, inferred_categories
 
 NAME = "astrbot_plugin_active_sticker"
 TURN = NAME + ".turn"
@@ -90,6 +91,9 @@ class ActiveSticker(Star):
         self.config = config
         self.library = StickerLibrary(StarTools.get_data_dir(NAME))
         self.sessions = OrderedDict()
+        self.receipts_path = self.library.root / "sent_stickers.json"
+        self.receipts_lock = asyncio.Lock()
+        self.load_sent_stickers()
         self.pending = {}
         self.index_errors = {}
         self.worker = None
@@ -123,6 +127,42 @@ class ActiveSticker(Star):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def load_sent_stickers(self):
+        if not self.receipts_path.exists():
+            return
+        try:
+            saved = json.loads(self.receipts_path.read_text(encoding="utf-8"))
+            for origin, data in saved.items():
+                session = Session(turns=data["turns"])
+                for persona, conversation, record in data["history"]:
+                    record["item"] = Sticker(**record["item"])
+                    session.history.append((persona, conversation, SentSticker(**record)))
+                self.sessions[origin] = session
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            self.sessions.clear()
+            logger.warning("主动表情暂时无法读取已发送记录")
+
+    async def save_sent_stickers(self):
+        async with self.receipts_lock:
+            saved = {
+                origin: {
+                    "turns": session.turns,
+                    "history": [
+                        (persona, conversation, asdict(sent)) for persona, conversation, sent in session.history
+                    ],
+                }
+                for origin, session in self.sessions.items()
+                if session.history
+            }
+            try:
+                await asyncio.to_thread(
+                    self.library.write,
+                    self.receipts_path,
+                    json.dumps(saved, ensure_ascii=False).encode("utf-8"),
+                )
+            except OSError:
+                logger.warning("主动表情暂时无法保存已发送记录")
 
     def enabled_in(self, origin, name=NAME):
         allowed = self.context.get_config(umo=origin).get("plugin_set", ["*"])
@@ -235,10 +275,15 @@ class ActiveSticker(Star):
             ),
         )
 
-    @staticmethod
-    def include_sent_stickers(request, sent_stickers):
-        if not sent_stickers:
-            return
+    def include_sent_stickers(self, request, sent_stickers):
+        count = len(self.library.available())
+        notes = []
+        if count:
+            notes.append(
+                f"你可用的本地表情库有 {count} 张已描述的图片。你可以在回复后继续决定是否想用表情表达自己，"
+                "先确定表达意图，再通过图片检索和发送工具挑合适的图；没有贴切的图可以不发。"
+                "本地表情库和微信原生表情收藏分别管理，原生收藏的查询结果只描述原生收藏。"
+            )
         replies = {}
         for sent in sent_stickers:
             entry = replies.setdefault(
@@ -254,12 +299,14 @@ class ActiveSticker(Star):
                 entry["我当时想表达"] = sent.meaning
             entry["我发送的表情"].append(sent.item.description[:200])
 
-        details = json.dumps(list(replies.values()), ensure_ascii=False)
-        note = (
-            "本会话中你在这些回复后亲自选择并发出了表情。发送工具按你的选择附图。"
-            "这是已经发生的对话记录，供你理解用户对表情的回应。\n" + details
-        )
-        request.extra_user_content_parts.append(TextPart(text=note).mark_as_temp())
+        if replies:
+            details = json.dumps(list(replies.values()), ensure_ascii=False)
+            notes.append(
+                "本会话中你在这些回复后亲自选择并发出了表情。发送工具按你的选择附图。"
+                "这是已经发生的对话记录，供你理解用户对表情的回应。\n" + details
+            )
+        if notes:
+            request.extra_user_content_parts.append(TextPart(text="\n".join(notes)).mark_as_temp())
 
     @filter.on_llm_response(priority=-200)
     async def remember_reply(self, event: AstrMessageEvent, response):
@@ -327,19 +374,10 @@ class ActiveSticker(Star):
                     "image": sent.item.description,
                     "after_speaker": sent.speaker,
                     "turns_ago": turn.number - sent.turn,
-                    "seconds_ago": int(time.monotonic() - sent.sent_at),
+                    "seconds_ago": max(0, int(time.time() - sent.sent_at)),
                 }
                 for sent in reversed(sent_here)
             ]
-            candidates = shortlist(
-                self.library.available(),
-                turn.user + "\n" + turn.reply,
-                turn.number,
-                recent_ids=(sticker["id"] for sticker in recent_stickers),
-            )
-            if not candidates:
-                return
-            max_images = max(1, min(20, int(self.config.get("burst_limit", 6))))
             scene = {
                 "人格": turn.persona,
                 "额外表情习惯": self.config.get("expression_style", ""),
@@ -353,8 +391,6 @@ class ActiveSticker(Star):
                 "自己已发的表情": recent_stickers,
                 "当前情绪": mood,
                 "长期表达习惯": {key: cognition[key] for key in ("character", "people") if key in cognition},
-                "本组可用图片数上限": max_images,
-                "候选图片": [item.summary() for item in candidates],
             }
             provider = self.config.get(
                 "expression_provider_id"
@@ -362,15 +398,52 @@ class ActiveSticker(Star):
             reply = await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=provider,
-                    system_prompt=EXPRESSION_PROMPT,
+                    system_prompt=INTENT_PROMPT,
                     prompt=json.dumps(scene, ensure_ascii=False),
                 ),
                 timeout=15,
             )
-            choice = object_response(reply.completion_text)
-            ids = selected_ids(choice, candidates, max_images)
-            meaning = choice.get("meaning")
+            intent = object_response(reply.completion_text)
+            meaning = intent.get("meaning")
             meaning = " ".join(meaning.split())[:160] if isinstance(meaning, str) else ""
+            if intent.get("want") is not True or not meaning or not self.current(turn):
+                return
+            max_images = max(1, min(20, int(self.config.get("burst_limit", 6))))
+            ids = ()
+            query = meaning
+            categories = ()
+            seen = set()
+            for _ in range(3):
+                if not self.current(turn):
+                    return
+                candidates, entries = self.library.search_index.search(query, categories, exclude=seen)
+                seen.update(item.id for item in candidates)
+                scene.update(
+                    {
+                        "我已决定的表达意图": meaning,
+                        "本组可用图片数上限": max_images,
+                        "分类文档目录": self.library.search_index.documents(),
+                        "本次检索": {"query": query, "categories": categories},
+                        "文档匹配条目": entries,
+                    }
+                )
+                selection = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider,
+                        system_prompt=EXPRESSION_PROMPT,
+                        prompt=json.dumps(scene, ensure_ascii=False),
+                    ),
+                    timeout=15,
+                )
+                choice = object_response(selection.completion_text)
+                if "send" in choice:
+                    ids = selected_ids(choice, candidates, max_images)
+                    break
+                search = choice.get("search")
+                if not isinstance(search, dict) or not isinstance(search.get("query"), str):
+                    break
+                query = search["query"][:300]
+                categories = category_names(search.get("categories", []))
             for index, ident in enumerate(ids):
                 if index:
                     await asyncio.sleep(0.45)
@@ -387,8 +460,9 @@ class ActiveSticker(Star):
                 )
                 if delivered is False or event.is_stopped():
                     break
-                sent = SentSticker(turn.number, time.monotonic(), item, turn.speaker, turn.reply[:240], meaning)
+                sent = SentSticker(turn.number, time.time(), item, turn.speaker, turn.reply[:240], meaning)
                 turn.session.history.append((turn.persona_id, turn.conversation_id, sent))
+                await self.save_sent_stickers()
         except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
             logger.warning("主动表情发送跳过 (%s)", type(error).__name__)
 
@@ -502,6 +576,7 @@ class ActiveSticker(Star):
                 "items": [
                     {
                         **asdict(item),
+                        "categories": inferred_categories(item),
                         "pending": item.id in self.pending,
                         "error": self.index_errors.get(item.id, ""),
                         "missing": not self.library.path(item).is_file(),
@@ -509,6 +584,7 @@ class ActiveSticker(Star):
                     for item in self.library.items.values()
                 ],
                 "vision_configured": bool(self.vision_provider()),
+                "categories": list(CATEGORIES),
             }
         )
 
@@ -545,7 +621,10 @@ class ActiveSticker(Star):
             return error_response("找不到图片", status_code=404)
         if not isinstance(data.get("enabled"), bool):
             return error_response("缺少启用状态", status_code=400)
-        self.library.update(item, **fields(data), enabled=data["enabled"])
+        values = fields(data)
+        if "categories" not in data:
+            values["categories"] = item.categories
+        self.library.update(item, **values, enabled=data["enabled"])
         self.index_errors.pop(item.id, None)
         return json_response({"saved": True})
 

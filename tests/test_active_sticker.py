@@ -12,7 +12,7 @@ from astrbot.api.event import MessageEventResult
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.message.message_event_result import ResultContentType
-from astrbot_plugin_active_sticker.expression import selected_ids, shortlist
+from astrbot_plugin_active_sticker.expression import INTENT_PROMPT, selected_ids
 from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
 from astrbot_plugin_active_sticker.main import ActiveSticker
 from PIL import Image
@@ -60,6 +60,14 @@ class Event:
 
 
 class StickerTest(unittest.IsolatedAsyncioTestCase):
+    def expression_model(self, selected, meaning="跟小林一起笑场"):
+        async def respond(**kwargs):
+            if kwargs["system_prompt"] == INTENT_PROMPT:
+                return SimpleNamespace(completion_text=json.dumps({"want": True, "meaning": meaning}))
+            return SimpleNamespace(completion_text=json.dumps({"send": selected}))
+
+        self.context.llm_generate.side_effect = respond
+
     async def asyncSetUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
@@ -91,21 +99,21 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
             activated=True,
             star_cls=SimpleNamespace(companion_snapshot=lambda _: {"inner_state": "笑出眼泪"}),
         )
-        self.context.llm_generate.return_value = SimpleNamespace(
-            completion_text=json.dumps({"send": [self.item.id, self.item.id]}),
-        )
+        self.expression_model([self.item.id, self.item.id])
         event = Event()
         provider_request = ProviderRequest(prompt="真好笑", system_prompt="主对话提示", contexts=[])
         before = vars(provider_request).copy()
         await self.plugin.capture(event, provider_request)
         self.context.llm_generate.assert_not_called()
+        self.assertIn("本地表情库", provider_request.extra_user_content_parts[0].text)
+        before["extra_user_content_parts"] = provider_request.extra_user_content_parts
         await self.plugin.after_reply(event)
         await self.plugin.after_reply(event)
         await asyncio.gather(*list(self.plugin.tasks))
         self.assertEqual(vars(provider_request), before)
         self.assertEqual(event.result.get_plain_text(), "笑得停不下来了")
         self.assertEqual(event.send.await_count, 2)
-        self.assertEqual(self.context.llm_generate.await_count, 1)
+        self.assertEqual(self.context.llm_generate.await_count, 2)
         prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
         self.assertEqual(prompt["人格"], "遇到好梗会狂笑")
         self.assertEqual(prompt["当前情绪"], {"inner_state": "笑出眼泪"})
@@ -123,9 +131,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         data = sticker_image("blue")
         second, _ = self.library.add("另一张.png", data, inspect_image(data))
         second = self.library.update(second, description="已经笑翻过去")
-        self.context.llm_generate.return_value = SimpleNamespace(
-            completion_text=json.dumps({"send": [self.item.id, second.id], "meaning": "跟小林一起笑场"}),
-        )
+        self.expression_model([self.item.id, second.id], meaning="跟小林一起爆笑，笑翻过去")
         event = Event()
         event.send.side_effect = [None, False]
         conversation = SimpleNamespace(cid="current-chat")
@@ -140,25 +146,25 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         (note,) = followup.extra_user_content_parts
         self.assertTrue(note.model_dump_for_context()["_no_save"])
         self.assertIn("你在这些回复后亲自选择并发出了表情", note.text)
-        self.assertIn("跟小林一起笑场", note.text)
+        self.assertIn("跟小林一起爆笑", note.text)
         self.assertIn("笑得停不下来了", note.text)
         self.assertIn("忍不住爆笑", note.text)
         self.assertNotIn("已经笑翻过去", note.text)
         self.assertEqual(followup.prompt, "你发的图是什么意思？")
-        self.assertEqual(self.context.llm_generate.await_count, 1)
+        self.assertEqual(self.context.llm_generate.await_count, 2)
 
         another_conversation = ProviderRequest(conversation=SimpleNamespace(cid="new-chat"))
         await self.plugin.capture(Event(), another_conversation)
-        self.assertEqual(another_conversation.extra_user_content_parts, [])
+        self.assertNotIn("亲自选择并发出了", another_conversation.extra_user_content_parts[0].text)
 
         another_persona = Event()
         another_persona.set_extra("_trace_persona_id", "other-persona")
         another_request = ProviderRequest(conversation=conversation)
         await self.plugin.capture(another_persona, another_request)
-        self.assertEqual(another_request.extra_user_content_parts, [])
+        self.assertNotIn("亲自选择并发出了", another_request.extra_user_content_parts[0].text)
 
     async def test_streaming_waits_for_completion_and_model_may_choose_silence(self):
-        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"send":[]}')
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"want":false}')
         event = Event(ResultContentType.STREAMING_RESULT)
         await self.plugin.capture(event, ProviderRequest())
         await self.plugin.stream_finished(event)
@@ -243,11 +249,75 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.worker
         self.assertEqual(self.library.items[item.id].description, "有点惊讶")
 
-    def test_recent_sticker_remains_available_for_a_callback_in_a_large_library(self):
-        others = tuple(replace(self.item, id=str(index), description="大家都笑疯了") for index in range(100))
-        picked = shortlist((*others, self.item), "笑疯了", 3, recent_ids=(self.item.id, "removed"))
-        self.assertEqual(len(picked), 48)
-        self.assertIn(self.item, picked)
+    async def test_declining_intent_never_searches_or_offers_the_library(self):
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"want":false}')
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        with patch.object(self.library.search_index, "search", side_effect=AssertionError("unexpected search")):
+            await self.plugin.after_reply(event)
+            await asyncio.gather(*list(self.plugin.tasks))
+        self.context.llm_generate.assert_awaited_once()
+        prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        self.assertNotIn("文档匹配条目", prompt)
+        self.assertNotIn("分类文档目录", prompt)
+        self.assertNotIn(self.item.id, json.dumps(prompt))
+        event.send.assert_not_called()
+
+    async def test_intent_can_find_no_suitable_image_without_sending(self):
+        self.expression_model([], meaning="真诚的安慰")
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        self.assertEqual(self.context.llm_generate.await_count, 2)
+        event.send.assert_not_called()
+        self.assertFalse(event.get_extra("astrbot_plugin_active_sticker.turn").session.history)
+
+    async def test_ai_can_change_search_words_and_read_a_category_document(self):
+        self.context.llm_generate.side_effect = [
+            SimpleNamespace(completion_text='{"want":true,"meaning":"很开心，想接着这个笑话笑"}'),
+            SimpleNamespace(completion_text='{"search":{"query":"爆笑","categories":["开心"]}}'),
+            SimpleNamespace(completion_text=json.dumps({"send": [self.item.id]})),
+        ]
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        self.assertEqual(self.context.llm_generate.await_count, 3)
+        prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        self.assertEqual(prompt["本次检索"]["categories"], ["开心"])
+        self.assertEqual(prompt["文档匹配条目"][0]["document"], "catalog/开心.md")
+        event.send.assert_awaited_once()
+
+    def test_large_library_returns_small_category_results_and_migrates_old_descriptions(self):
+        others = tuple(
+            replace(self.item, id=f"{index:016x}", description="难过流泪", categories=("难过",))
+            for index in range(100)
+        )
+        self.library.commit({item.id: item for item in (*others, self.item)})
+        rebuilt = StickerLibrary(self.library.root)
+        matches, entries = rebuilt.search_index.search("爆笑", ("开心",))
+        self.assertEqual([item.id for item in matches], [self.item.id])
+        matches, entries = rebuilt.search_index.search("难过", ("难过",))
+        self.assertLessEqual(len(matches), 12)
+        self.assertLessEqual(len(json.dumps(entries, ensure_ascii=False)), 6100)
+        self.assertIn(self.item.id, (rebuilt.root / "catalog/开心.md").read_text("utf-8"))
+        self.assertNotIn(self.item.id, (rebuilt.root / "library.md").read_text("utf-8"))
+
+    async def test_successful_expression_survives_a_plugin_reload(self):
+        self.expression_model([self.item.id])
+        event = Event()
+        conversation = SimpleNamespace(cid="saved-chat")
+        await self.plugin.capture(event, ProviderRequest(conversation=conversation))
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        with patch("astrbot_plugin_active_sticker.main.StarTools.get_data_dir", return_value=self.library.root):
+            reloaded = ActiveSticker(self.context, self.plugin.config)
+        request = ProviderRequest(conversation=conversation)
+        await reloaded.capture(Event(), request)
+        self.assertIn("忍不住爆笑", request.extra_user_content_parts[0].text)
+        self.assertIn("跟小林一起笑场", request.extra_user_content_parts[0].text)
+        await reloaded.terminate()
 
     def test_invalid_model_ids_cannot_select_files(self):
         self.assertEqual(selected_ids({"send": ["../../example"]}, [self.item], 6), ())

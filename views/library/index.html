@@ -43,6 +43,7 @@
         <option value="waiting">待识图</option>
         <option value="disabled">已停用</option>
       </select>
+      <select id="category" aria-label="按分类筛选"><option value="">全部分类</option></select>
     </section>
     <div id="gallery" class="gallery"></div>
     <p id="empty" class="empty" hidden></p>
@@ -96,6 +97,8 @@
     <label>画面与语气 <textarea id="description" rows="3" maxlength="480"></textarea></label>
     <label>适合怎么回 <textarea id="usage" rows="3" maxlength="400"></textarea></label>
     <label>标签 <input id="tags" placeholder="用逗号分隔"></label>
+    <label>粗分类 <input id="categories" list="category-names" placeholder="如 开心、调侃，可选多个"></label>
+    <datalist id="category-names"></datalist>
     <label class="check"><input id="enabled" type="checkbox">参与自动选图</label>
     <div class="actions footer">
       <button id="delete" type="button" class="danger">删除</button>
