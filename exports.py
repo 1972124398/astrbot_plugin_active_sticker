@@ -32,6 +32,10 @@ CSV_FIELDS = (
     "识图模型",
     "识图时间（UTC）",
     "最近识图错误",
+    "自动识图核心表达",
+    "自动识图语气",
+    "图中文字",
+    "自动识图误用限制",
 )
 
 
@@ -49,6 +53,7 @@ def csv_bytes(snapshot):
     writer.writerow(CSV_FIELDS)
     for item in snapshot["rows"]:
         vision = item.get("vision_result") or {}
+        retrieval = vision.get("retrieval") or {}
         state = (
             "识图中"
             if item["pending"]
@@ -82,6 +87,10 @@ def csv_bytes(snapshot):
             vision.get("provider", ""),
             vision.get("recognized_at", ""),
             item["error"],
+            retrieval.get("meaning", ""),
+            retrieval.get("tone", ""),
+            retrieval.get("text", ""),
+            retrieval.get("avoid", ""),
         )
         writer.writerow(csv_cell(value) for value in values)
     # BOM allows Excel to recognize Chinese text when the CSV is opened directly.
@@ -108,6 +117,7 @@ def write_export(root, snapshot, *, documents=False):
 - index.json：完整的图片、风格包和已保存的自动识图结果元数据。
 - catalog.md：插件生成的可用图片描述总表。
 - library.md 和 catalog/：插件生成的可用图片分类目录及描述文档。
+- retrieval-index.json：当前精简检索卡、风格包归属、分类及索引版本。
 
 「画面与语气／适合怎么回／标签／表达分类」是当前使用的结果，包含人工整理。
 「自动识图」列是本版起保存的最近一次成功识图结果；未留存或未成功识图时为空。

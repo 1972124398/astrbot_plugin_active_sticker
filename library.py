@@ -9,12 +9,13 @@ import re
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image as PillowImage
 from PIL import ImageOps
 
-from .retrieval import CATEGORIES, CatalogIndex, inferred_categories
+from .retrieval import CATEGORIES, INDEX_VERSION, RESULT_CHARS, RESULT_LIMIT, CatalogIndex, inferred_categories
 
 FORMATS = {"PNG": "png", "JPEG": "jpg", "GIF": "gif", "WEBP": "webp"}
 MAX_BYTES = 16 * 1024 * 1024
@@ -250,18 +251,31 @@ class StickerLibrary:
                 lines.append(f"  - 标签 {tags}")
         return "\n".join(lines) + "\n"
 
-    def write_catalog(self):
-        self.write(self.root / "catalog.md", self.catalog().encode("utf-8"))
-        self.search_index = CatalogIndex(self.available())
-        grouped = {ident: [] for ident in self.packs}
-        for item in self.search_index.items.values():
+    @staticmethod
+    def build_index(items, packs):
+        search_index = CatalogIndex(items)
+        grouped = {ident: [] for ident in packs}
+        for item in search_index.items.values():
             grouped[item.pack_id].append(item)
-        self.pack_indexes = {ident: CatalogIndex(group) for ident, group in grouped.items()}
+        pack_indexes = {ident: CatalogIndex(group) for ident, group in grouped.items()}
+        return search_index, pack_indexes
+
+    def write_catalog(self, state=None):
+        search_index, pack_indexes = state if state is not None else self.build_index(self.available(), self.packs)
+        stats = {
+            "version": INDEX_VERSION,
+            "items": len(search_index.items),
+            "packs": sum(bool(index.items) for index in pack_indexes.values()),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "candidate_limit": RESULT_LIMIT,
+            "candidate_chars": RESULT_CHARS,
+        }
+        self.write(self.root / "catalog.md", self.catalog().encode("utf-8"))
         documents = self.root / "catalog"
         documents.mkdir(exist_ok=True)
         overview = ["# 表情库分类目录", "", "按表达意图检索分类文档中的条目。", ""]
         for name in CATEGORIES:
-            ids = self.search_index.groups[name]
+            ids = search_index.groups[name]
             lines = [f"# {name}", ""]
             for ident in self.items:
                 if ident in ids:
@@ -270,6 +284,20 @@ class StickerLibrary:
             if ids:
                 overview.append(f"- [{name}](catalog/{name}.md) · {len(ids)} 张")
         self.write(self.root / "library.md", "\n".join(overview).encode("utf-8"))
+        profiles = [
+            {
+                "id": item.id,
+                "pack_id": item.pack_id,
+                "categories": search_index.categories[item.id],
+                **search_index.profiles[item.id],
+            }
+            for item in search_index.items.values()
+        ]
+        self.write(
+            self.root / "retrieval-index.json",
+            json.dumps({**stats, "profiles": profiles}, ensure_ascii=False, separators=(",", ":")).encode(),
+        )
+        self.search_index, self.pack_indexes, self.index_stats = search_index, pack_indexes, stats
 
     def pack_snapshot(self, ident):
         return (
@@ -297,7 +325,12 @@ class StickerLibrary:
             )
         files = {}
         if documents:
-            for name in ("catalog.md", "library.md", *(f"catalog/{name}.md" for name in CATEGORIES)):
+            for name in (
+                "catalog.md",
+                "library.md",
+                "retrieval-index.json",
+                *(f"catalog/{name}.md" for name in CATEGORIES),
+            ):
                 files[name] = (self.root / name).read_bytes()
         return {
             "rows": rows,

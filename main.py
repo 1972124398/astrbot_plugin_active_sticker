@@ -29,7 +29,7 @@ from .expression import (
     selected_ids,
 )
 from .library import DEFAULT_PACK, MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
-from .retrieval import CATEGORIES, category_names, inferred_categories
+from .retrieval import CATEGORIES, category_names, inferred_categories, retrieval_fields
 from .styles import PackLease, choose_pack
 
 NAME = "astrbot_plugin_active_sticker"
@@ -111,6 +111,8 @@ class ActiveSticker(Star):
         self.pending = {}
         self.index_errors = {}
         self.worker = None
+        self.rebuild_worker = None
+        self.rebuild_error = ""
         self.tasks = set()
         self.closing = False
         for route, handler, method in (
@@ -122,6 +124,7 @@ class ActiveSticker(Star):
             ("edit", self.web_edit, "POST"),
             ("delete", self.web_delete, "POST"),
             ("index", self.web_index, "POST"),
+            ("index/rebuild", self.web_rebuild_index, "POST"),
             ("catalog", self.web_catalog, "GET"),
             ("export/csv", self.web_export_csv, "GET"),
             ("export/documents", self.web_export_documents, "GET"),
@@ -144,6 +147,8 @@ class ActiveSticker(Star):
         tasks = list(self.tasks)
         if self.worker:
             tasks.append(self.worker)
+        if self.rebuild_worker:
+            tasks.append(self.rebuild_worker)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -454,7 +459,7 @@ class ActiveSticker(Star):
                 self.context.llm_generate(
                     chat_provider_id=provider,
                     system_prompt=INTENT_PROMPT,
-                    prompt=json.dumps(scene, ensure_ascii=False),
+                    prompt=json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
                 ),
                 timeout=15,
             )
@@ -468,30 +473,35 @@ class ActiveSticker(Star):
             query = meaning
             categories = ()
             seen = set()
+            searches = set()
             for _ in range(3):
                 if not self.current(turn):
                     return
                 search_index = self.library.pack_indexes.get(turn.pack_id)
                 if search_index is None or not search_index.items:
                     return
-                candidates, entries = search_index.search(query, categories, exclude=seen)
+                search_key = (query, tuple(categories))
+                if search_key in searches:
+                    break
+                searches.add(search_key)
+                candidates, entries = search_index.search(query, categories, exclude=seen, compact=True)
                 seen.update(item.id for item in candidates)
-                scene.update(
-                    {
-                        "我已决定的表达意图": meaning,
-                        "本组可用图片数上限": max_images,
-                        "当前风格包": self.library.packs[turn.pack_id].name,
-                        "选图约束": "只使用当前风格包。没有贴切素材就不发，不跨包补图。",
-                        "分类文档目录": search_index.documents(),
-                        "本次检索": {"query": query, "categories": categories},
-                        "文档匹配条目": entries,
-                    }
-                )
+                selection_scene = {
+                    "我已决定的表达意图": meaning,
+                    "已经发出的回复": turn.reply[-500:],
+                    "当前说话人": turn.speaker,
+                    "本组可用图片数上限": max_images,
+                    "当前风格包": self.library.packs[turn.pack_id].name,
+                    "选图约束": "只使用当前风格包。没有贴切素材就不发，不跨包补图。",
+                    "分类文档目录": search_index.directory(),
+                    "本次检索": {"query": query, "categories": categories},
+                    "文档匹配条目": entries,
+                }
                 selection = await asyncio.wait_for(
                     self.context.llm_generate(
                         chat_provider_id=provider,
                         system_prompt=EXPRESSION_PROMPT,
-                        prompt=json.dumps(scene, ensure_ascii=False),
+                        prompt=json.dumps(selection_scene, ensure_ascii=False, separators=(",", ":")),
                     ),
                     timeout=15,
                 )
@@ -592,6 +602,7 @@ class ActiveSticker(Star):
                 else:
                     vision_result = {
                         **values,
+                        "retrieval": retrieval_fields(object_response(result.completion_text)),
                         "provider": provider,
                         "recognized_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     }
@@ -667,6 +678,11 @@ class ActiveSticker(Star):
                 ],
                 "vision_configured": bool(self.vision_provider()),
                 "categories": list(CATEGORIES),
+                "search_index": {
+                    **self.library.index_stats,
+                    "rebuilding": bool(self.rebuild_worker and not self.rebuild_worker.done()),
+                    "error": self.rebuild_error,
+                },
                 "packs": [
                     {
                         **asdict(pack),
@@ -752,6 +768,31 @@ class ActiveSticker(Star):
         if not item or not self.library.path(item).is_file():
             return error_response("找不到图片", status_code=404)
         return json_response({"queued": self.queue_index([item])})
+
+    async def web_rebuild_index(self):
+        if self.closing:
+            return error_response("插件正在关闭", status_code=409)
+        running = self.rebuild_worker is not None and not self.rebuild_worker.done()
+        if not running:
+            self.rebuild_error = ""
+            self.rebuild_worker = asyncio.create_task(self.rebuild_index())
+        return json_response({"queued": not running, "running": True})
+
+    async def rebuild_index(self):
+        try:
+            for _ in range(3):
+                items, packs = self.library.items, self.library.packs
+                available = self.library.available()
+                state = await asyncio.to_thread(self.library.build_index, available, tuple(packs))
+                if self.closing:
+                    return
+                if self.library.items is items and self.library.packs is packs:
+                    self.library.write_catalog(state)
+                    return
+            self.rebuild_error = "图库仍在变化，已保留最新自动索引；可在整理或识图结束后重试"
+        except Exception as error:  # noqa: BLE001 - management failure must not affect chat
+            self.rebuild_error = "索引整理失败，请重试"
+            logger.warning("主动表情索引整理失败 (%s)", type(error).__name__)
 
     async def web_catalog(self):
         return file_response(self.library.root / "catalog.md", filename="catalog.md", content_type="text/markdown")

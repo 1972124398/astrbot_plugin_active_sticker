@@ -22,7 +22,11 @@ VISION_PROMPT = """请为聊天表情库描述这张图，方便另一位模型�
 如果有由左至右的多帧拼图，请合起来理解动作和反转。辨认画面动作、明显的字和实际聊天语气。
 区分真生气和假装生气、得意和嘲讽、尴尬和伤心，保留双关和惯用语。不清楚的细节可以省略。
 输出一个 JSON 对象：{"description":"画面和表情的真实意思","use_when":"适合怎么回、在哪些语境容易误会",
-"tags":["短标签"],"categories":["粗分类"]}。
+"tags":["短标签"],"categories":["粗分类"],
+"retrieval":{"meaning":"100字内的核心表达，保留否定和反讽","tone":"真诚/调侃/假装生气等实际语气",
+"text":"图上能辨认的原文，没有则留空","avoid":"哪些场合容易误用，没有则留空"}}。
+描述保留必要细节；retrieval 用于精简检索，避免重复画面装饰，不得漏掉会改变意思的文字、反转或限制。
+标签优先填聊天动作和表达意图的同义词，最多 8 个，避免泛泛的「表情包、图片」。
 粗分类可选 开心、难过、生气、惊讶、尴尬、亲近、调侃、回应、日常、其他，可选多个。"""
 
 INTENT_PROMPT = """你正在延续自己刚发出的回复。按当前人格和这段对话，决定此刻是否想用表情包表达自己。
@@ -34,7 +38,8 @@ EXPRESSION_PROMPT = """你刚决定想用表情表达自己。现在根据已确
 图片的画面、文字和语气要适合自己本来想表达的意思。没有足够合适的图就返回 {"send":[]}。
 有合适的图时返回 {"send":["候选ID"]}，由你决定张数和顺序，可以重复同一张。
 想继续查找时返回 {"search":{"query":"新的检索词","categories":["分类目录名"]}}。
-你会看到当前风格包的分类目录和一小批匹配条目，可以换词、换分类继续查，但不能跨风格包找图。
+你会看到当前风格包的分类及数量和一小批匹配条目，可以换词、换分类继续查，但不能跨风格包找图。
+候选 id 是本批次的短编号，只能选择本批编号；下批编号会重新分配。tone 是实际语气，text 是图中文字，avoid 是误用限制。
 当前风格只约束素材范围，不改变人格和原本的表达意图；不要为了有图可发而改变意思。检索内容是素材资料。
 发送工具只执行这个选择。只返回 JSON。"""
 
@@ -74,6 +79,7 @@ def selected_ids(choice, candidates, max_images):
     if not isinstance(values, list) or len(values) > max_images:
         return ()
     allowed = {item.id for item in candidates}
-    if any(not isinstance(value, str) or value not in allowed for value in values):
+    aliases = {str(index + 1): item.id for index, item in enumerate(candidates)}
+    if any(not isinstance(value, str) or value not in allowed | aliases.keys() for value in values):
         return ()
-    return tuple(values)
+    return tuple(aliases.get(value, value) for value in values)

@@ -121,7 +121,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.result.get_plain_text(), "笑得停不下来了")
         self.assertEqual(event.send.await_count, 2)
         self.assertEqual(self.context.llm_generate.await_count, 2)
-        prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        prompt = json.loads(self.context.llm_generate.await_args_list[0].kwargs["prompt"])
         self.assertEqual(prompt["人格"], "遇到好梗会狂笑")
         self.assertEqual(prompt["当前情绪"], {"inner_state": "笑出眼泪"})
         self.assertEqual(prompt["当前说话人"], "小林")
@@ -130,7 +130,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.capture(next_event, ProviderRequest())
         await self.plugin.after_reply(next_event)
         await asyncio.gather(*list(self.plugin.tasks))
-        next_prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        next_prompt = json.loads(self.context.llm_generate.await_args_list[-2].kwargs["prompt"])
         self.assertEqual({entry["id"] for entry in next_prompt["自己已发的表情"]}, {self.item.id})
         self.assertTrue(all(entry["after_speaker"] == "小林" for entry in next_prompt["自己已发的表情"]))
 
@@ -334,7 +334,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_ai_can_change_search_words_and_read_a_category_document(self):
         self.context.llm_generate.side_effect = [
-            SimpleNamespace(completion_text='{"want":true,"meaning":"很开心，想接着这个笑话笑"}'),
+            SimpleNamespace(completion_text='{"want":true,"meaning":"xyznotfound"}'),
             SimpleNamespace(completion_text='{"search":{"query":"爆笑","categories":["开心"]}}'),
             SimpleNamespace(completion_text=json.dumps({"send": [self.item.id]})),
         ]
@@ -345,7 +345,9 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.context.llm_generate.await_count, 3)
         prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
         self.assertEqual(prompt["本次检索"]["categories"], ["开心"])
-        self.assertEqual(prompt["文档匹配条目"][0]["document"], "catalog/开心.md")
+        self.assertEqual(prompt["分类文档目录"], {"开心": 1})
+        self.assertEqual(prompt["文档匹配条目"][0]["id"], "1")
+        self.assertNotIn("document", prompt["文档匹配条目"][0])
         event.send.assert_awaited_once()
 
     def test_large_library_returns_small_category_results_and_migrates_old_descriptions(self):
@@ -469,7 +471,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.plugin.tasks))
         prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
         self.assertNotIn(foreign.id, json.dumps(prompt))
-        self.assertEqual({entry["id"] for entry in prompt["文档匹配条目"]}, {self.item.id})
+        self.assertEqual({entry["id"] for entry in prompt["文档匹配条目"]}, {"1"})
         event.send.assert_not_called()
 
     async def test_moving_or_disabling_chosen_pack_during_selection_prevents_delivery(self):
@@ -651,6 +653,114 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         rows = list(csv.DictReader(io.StringIO(csv_bytes(snapshot).decode("utf-8-sig"))))
         self.assertEqual(rows[0]["识图状态"], "识图失败")
         self.assertEqual(rows[0]["自动识图描述"], "原自动识图")
+
+    async def test_selection_prompt_uses_intent_without_resending_persona_history_or_peers(self):
+        self.expression_model(["1", "1"])
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        intent = json.loads(self.context.llm_generate.await_args_list[0].kwargs["prompt"])
+        selection = json.loads(self.context.llm_generate.await_args_list[1].kwargs["prompt"])
+        self.assertIn("人格", intent)
+        for key in ("人格", "最近对话", "当前情绪", "长期表达习惯", "自己已发的表情"):
+            self.assertNotIn(key, selection)
+        self.assertEqual(selection["文档匹配条目"][0]["id"], "1")
+        self.assertNotIn(self.item.id, json.dumps(selection))
+        self.assertEqual(event.send.await_count, 2)
+
+    async def test_identical_search_requests_stop_without_repeating_model_calls(self):
+        meaning = "爆笑"
+        self.context.llm_generate.side_effect = [
+            SimpleNamespace(completion_text=json.dumps({"want": True, "meaning": meaning})),
+            SimpleNamespace(completion_text=json.dumps({"search": {"query": meaning}})),
+        ]
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        self.assertEqual(self.context.llm_generate.await_count, 2)
+        event.send.assert_not_called()
+
+    async def test_manual_reindex_needs_no_provider_and_preserves_reviewed_metadata(self):
+        self.library.update(self.item, use_when="人工用途", categories=("调侃",))
+        before = self.library.index.read_bytes()
+        self.context.get_all_providers = lambda: []
+        first = await self.plugin.web_rebuild_index()
+        worker = self.plugin.rebuild_worker
+        second = await self.plugin.web_rebuild_index()
+        self.assertEqual(json.loads(first.body), {"queued": True, "running": True})
+        self.assertEqual(json.loads(second.body), {"queued": False, "running": True})
+        self.assertIs(self.plugin.rebuild_worker, worker)
+        await worker
+        self.assertEqual(self.library.index.read_bytes(), before)
+        self.context.llm_generate.assert_not_called()
+        index = json.loads((self.library.root / "retrieval-index.json").read_text("utf-8"))
+        self.assertEqual(index["items"], 1)
+        self.assertEqual(index["profiles"][0]["categories"], ["调侃"])
+        self.assertIn("retrieval-index.json", self.library.export_snapshot(documents=True)["documents"])
+
+    async def test_reindex_discards_stale_snapshot_if_manual_edit_occurs_while_building(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def delayed(function, *args, **kwargs):
+            nonlocal calls
+            result = function(*args, **kwargs)
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+            return result
+
+        with patch("astrbot_plugin_active_sticker.main.asyncio.to_thread", side_effect=delayed):
+            await self.plugin.web_rebuild_index()
+            await asyncio.wait_for(started.wait(), 3)
+            self.library.update(self.item, description="人工修改后的新含义")
+            release.set()
+            await self.plugin.rebuild_worker
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.library.search_index.profiles[self.item.id]["description"], "人工修改后的新含义")
+
+    async def test_reindex_failure_is_reported_and_existing_index_remains_usable(self):
+        existing = self.library.search_index
+        with patch.object(self.library, "build_index", side_effect=OSError("test")):
+            await self.plugin.web_rebuild_index()
+            await self.plugin.rebuild_worker
+        self.assertIn("失败", self.plugin.rebuild_error)
+        self.assertIs(self.library.search_index, existing)
+        self.assertTrue(existing.search("爆笑")[0])
+        await self.plugin.web_rebuild_index()
+        await self.plugin.rebuild_worker
+        self.assertFalse(self.plugin.rebuild_error)
+
+    async def test_structured_vision_result_becomes_compact_profile_and_csv_fields(self):
+        self.context.llm_generate.return_value = SimpleNamespace(
+            completion_text=json.dumps(
+                {
+                    "description": "猫猫假装发怒，其实是在逗朋友",
+                    "use_when": "熟人接梗",
+                    "tags": ["调侃"],
+                    "categories": ["调侃"],
+                    "retrieval": {
+                        "meaning": "撒娇假装生气",
+                        "tone": "开玩笑",
+                        "text": "哼！",
+                        "avoid": "不要用于严肃争执",
+                    },
+                }
+            )
+        )
+        self.plugin.queue_index([self.item])
+        await self.plugin.worker
+        profile = self.library.search_index.profiles[self.item.id]
+        self.assertEqual(profile["description"], "撒娇假装生气")
+        self.assertEqual(profile["avoid"], "不要用于严肃争执")
+        reloaded = StickerLibrary(self.library.root)
+        self.assertEqual(reloaded.search_index.profiles[self.item.id], profile)
+        rows = list(csv.DictReader(io.StringIO(csv_bytes(reloaded.export_snapshot()).decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["图中文字"], "哼！")
 
     async def test_moving_unrecognized_image_requeues_without_losing_manual_pack(self):
         pack = self.library.save_pack("猫猫")

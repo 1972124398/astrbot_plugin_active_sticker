@@ -209,7 +209,13 @@ async function refresh() {
     if (changed) packOptions();
     if (changed || gallery.childElementCount === 0) render();
     $("vision-hint").hidden = visionReady;
-    if (items.some((item) => item.pending) || importing) timer = window.setTimeout(refresh, 1800);
+    const index = snapshot.search_index;
+    $("rebuild-index").disabled = Boolean(index?.rebuilding);
+    $("rebuild-index").textContent = index?.rebuilding ? "正在整理索引…" : "整理检索索引";
+    $("index-status").textContent = index?.rebuilding ? "正在用已有描述重建索引，无需重新识图。" : index?.error
+      || (index ? "检索索引 · " + index.items + " 张可用 · " + index.packs + " 个风格包 · 每批最多 " + index.candidate_limit + " 张"
+        + (index.updated_at ? " · 更新于 " + new Date(index.updated_at).toLocaleString() : "") : "");
+    if (items.some((item) => item.pending) || importing || index?.rebuilding) timer = window.setTimeout(refresh, 1800);
   } catch (error) {
     if (generation === refreshGeneration) report(error.message);
   }
@@ -308,6 +314,13 @@ $("retry").addEventListener("click", () => action(async () => {
   const result = await bridge.apiPost("index", {});
   report(result.queued + " 张图片已加入识图队列");
   await refresh();
+}));
+$("rebuild-index").addEventListener("click", () => action(async () => {
+  $("rebuild-index").disabled = true;
+  try {
+    await bridge.apiPost("index/rebuild", {});
+    report("已触发全库索引整理，保留手动描述与风格包，不消耗模型 token。");
+  } finally { await refresh(); }
 }));
 $("export").addEventListener("click", () => action(() => bridge.download("catalog", {}, "catalog.md")));
 for (const [id, endpoint, filename] of [
