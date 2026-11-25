@@ -16,6 +16,12 @@
     </div>
   </header>
   <section id="library-panel" role="tabpanel" aria-labelledby="library-tab">
+    <section class="pack-section" aria-label="风格包">
+      <div class="pack-heading"><div><p class="eyebrow">按风格整理 · 按语境表达</p><h2>我的风格包</h2></div><button id="new-pack" class="primary" type="button">＋ 新建风格包</button></div>
+      <p class="muted">把同一角色、画风的图片放进一包。短期对话只用一个包；空闲后，下次聊天才可能换包。</p>
+      <div id="pack-list" class="pack-list"></div>
+      <div class="pack-heading"><p id="pack-detail" class="muted"></p><div class="actions"><button id="edit-pack" type="button" hidden>管理此包</button><button id="export-pack" type="button" hidden>打包下载</button></div></div>
+    </section>
     <header class="library-header">
       <div>
         <p id="counts" class="muted" aria-live="polite">正在读取表情库…</p>
@@ -34,6 +40,7 @@
       <span>拖入图片或点击批量选择 · PNG、JPEG、GIF、WebP</span>
     </button>
     <input id="files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+    <label class="import-target">导入到 <select id="import-pack" aria-label="导入到风格包"></select></label>
     <p id="notice" class="notice" role="status" hidden></p>
     <section class="toolbar" aria-label="筛选表情">
       <input id="search" type="search" placeholder="搜索文件名、描述或标签" aria-label="搜索表情">
@@ -43,7 +50,12 @@
         <option value="waiting">待识图</option>
         <option value="disabled">已停用</option>
       </select>
-      <select id="category" aria-label="按分类筛选"><option value="">全部分类</option></select>
+      <select id="category" aria-label="按用途筛选"><option value="">全部表达用途</option></select>
+    </section>
+    <section class="organize-bar" aria-label="批量整理">
+      <label class="check"><input id="select-all" type="checkbox">选择筛选结果</label><span id="selected-count" aria-live="polite">已选 0 张</span>
+      <select id="move-pack" aria-label="移动到风格包"></select><button id="move-selected" type="button">移动</button>
+      <button id="enable-selected" type="button">启用</button><button id="disable-selected" type="button">停用</button><button id="clear-selected" type="button">清空选择</button>
     </section>
     <div id="gallery" class="gallery"></div>
     <p id="empty" class="empty" hidden></p>
@@ -77,6 +89,14 @@
         </label>
       </fieldset>
       <fieldset>
+        <legend>风格保持</legend>
+        <div class="model-fields">
+          <label>刷新所需空闲时间（小时）<input id="pack_idle_hours" type="number" min="0.0166666667" max="168" step="any" required><small>默认 6 小时。连续聊天保持原包；空闲满此时间，下次对话才尝试换包。</small></label>
+          <label>更换概率（%）<input id="pack_switch_percent" type="number" min="0" max="100" step="1" required><small>默认 50%。0 为保持，100 为有其他可用包时必换。</small></label>
+        </div>
+        <small>每个会话、人格分别保持风格。当前包没有贴切素材时，AI 可以不发表情。</small>
+      </fieldset>
+      <fieldset>
         <legend>可选联动</legend>
         <label class="check"><input id="interop_enabled" type="checkbox">启用插件联动</label>
         <label class="check peer-toggle"><input id="link_short_term_mood" type="checkbox">短期共享情绪</label>
@@ -94,10 +114,12 @@
   <div id="edit-form">
     <div class="editor-head"><h2 id="image-name"></h2><button id="close" type="button" aria-label="关闭">×</button></div>
     <div id="editor-picture" class="picture"></div>
+    <label>图片名称 <input id="edit-name" maxlength="160" required></label>
+    <label>所属风格包 <select id="edit-item-pack"></select></label>
     <label>画面与语气 <textarea id="description" rows="3" maxlength="480"></textarea></label>
     <label>适合怎么回 <textarea id="usage" rows="3" maxlength="400"></textarea></label>
     <label>标签 <input id="tags" placeholder="用逗号分隔"></label>
-    <label>粗分类 <input id="categories" list="category-names" placeholder="如 开心、调侃，可选多个"></label>
+    <label>表达用途 <input id="categories" list="category-names" placeholder="如 开心、调侃，可选多个"></label>
     <datalist id="category-names"></datalist>
     <label class="check"><input id="enabled" type="checkbox">参与自动选图</label>
     <div class="actions footer">
@@ -113,6 +135,18 @@
       </div>
     </div>
     <p id="edit-error" role="alert" hidden></p>
+  </div>
+</dialog>
+<dialog id="pack-editor">
+  <div id="pack-form" class="pack-form">
+    <div class="editor-head"><h2 id="pack-editor-title">新建风格包</h2><button id="close-pack" type="button" aria-label="关闭">×</button></div>
+    <label>名称<input id="pack-name" maxlength="60" required placeholder="例如：猫猫日常、像素小人"></label>
+    <label>风格说明<textarea id="pack-description" rows="3" maxlength="300" placeholder="方便自己整理和辨认风格"></textarea></label>
+    <label class="check"><input id="pack-enabled" type="checkbox" checked>参与对话选包</label>
+    <p class="muted">停用后保留所有图片。删除包会将图片移回「未分组」。</p>
+    <div class="actions footer"><button id="delete-pack" type="button" class="danger" hidden>删除风格包</button><button id="save-pack" class="primary" type="button">保存</button></div>
+    <div id="pack-delete-confirmation" class="delete-confirmation" hidden><span>将图片移回未分组并删除此包？</span><button id="cancel-delete-pack" type="button">取消</button><button id="confirm-delete-pack" type="button" class="danger">确认删除包</button></div>
+    <p id="pack-error" class="danger" role="alert" hidden></p>
   </div>
 </dialog>
 <script type="module" src="./app.js"></script>

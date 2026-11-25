@@ -15,6 +15,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import PluginUploadFile, error_response, file_response, json_response, request
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import ResultContentType
+from starlette.background import BackgroundTask
 
 from .expression import (
     CHAT_EXPRESSION_PROMPT,
@@ -25,8 +26,9 @@ from .expression import (
     object_response,
     selected_ids,
 )
-from .library import MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
+from .library import DEFAULT_PACK, MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
 from .retrieval import CATEGORIES, category_names, inferred_categories
+from .styles import PackLease, choose_pack
 
 NAME = "astrbot_plugin_active_sticker"
 TURN = NAME + ".turn"
@@ -46,6 +48,7 @@ class SentSticker:
 class Session:
     turns: int = 0
     history: deque[tuple[str, str, SentSticker]] = field(default_factory=lambda: deque(maxlen=12))
+    packs: OrderedDict[str, PackLease] = field(default_factory=OrderedDict)
 
     def sent_in(self, persona_id, conversation_id):
         return [
@@ -71,6 +74,7 @@ class Turn:
     reply_images: bool = False
     reply: str = ""
     scheduled: bool = False
+    pack_id: str = ""
 
 
 def message_text(value):
@@ -117,6 +121,10 @@ class ActiveSticker(Star):
             ("delete", self.web_delete, "POST"),
             ("index", self.web_index, "POST"),
             ("catalog", self.web_catalog, "GET"),
+            ("packs/save", self.web_save_pack, "POST"),
+            ("packs/delete", self.web_delete_pack, "POST"),
+            ("organize", self.web_organize, "POST"),
+            ("packs/export", self.web_export_pack, "GET"),
         ):
             context.register_web_api(f"/{NAME}/{route}", handler, [method], "主动表情面板")
 
@@ -143,6 +151,8 @@ class ActiveSticker(Star):
             saved = json.loads(self.receipts_path.read_text(encoding="utf-8"))
             for origin, data in saved.items():
                 session = Session(turns=data["turns"])
+                for key, lease in list(data.get("packs", {}).items())[-32:]:
+                    session.packs[key] = PackLease(**lease)
                 for persona, conversation, record in data["history"]:
                     record["item"] = Sticker(**record["item"])
                     session.history.append((persona, conversation, SentSticker(**record)))
@@ -159,9 +169,10 @@ class ActiveSticker(Star):
                     "history": [
                         (persona, conversation, asdict(sent)) for persona, conversation, sent in session.history
                     ],
+                    "packs": {key: asdict(lease) for key, lease in session.packs.items()},
                 }
                 for origin, session in self.sessions.items()
-                if session.history
+                if session.history or session.packs
             }
             try:
                 await asyncio.to_thread(
@@ -220,7 +231,15 @@ class ActiveSticker(Star):
         ):
             return {}
         items = self.library.available()
-        return {"version": 1, "items": [item.summary() for item in items]} if items else {}
+        return (
+            {
+                "version": 1,
+                "items": [item.summary() for item in items],
+                "packs": [asdict(pack) for pack in self.library.packs.values() if pack.enabled],
+            }
+            if items
+            else {}
+        )
 
     def get_persona(self, event, request):
         persona_id = event.get_extra("_trace_persona_id")
@@ -264,7 +283,16 @@ class ActiveSticker(Star):
         # Keep the character separate from the request-scoped capability instructions.
         persona = self.get_persona(event, request)[-12000:]
         session = self.sessions.setdefault(origin, Session())
-        self.include_sent_stickers(request, session.sent_in(persona_id, conversation_id))
+        available_packs = {item.pack_id for item in self.library.available()}
+        pack_id = choose_pack(
+            session.packs,
+            json.dumps([persona_id, conversation_id]),
+            [ident for ident in self.library.packs if ident in available_packs],
+            time.time(),
+            max(1, int(self.config.get("pack_idle_minutes", 360))) * 60,
+            max(0, min(100, int(self.config.get("pack_switch_percent", 50)))) / 100,
+        )
+        self.include_sent_stickers(request, session.sent_in(persona_id, conversation_id), pack_id)
         self.sessions.move_to_end(origin)
         if len(self.sessions) > 512:
             self.sessions.popitem(last=False)
@@ -283,11 +311,13 @@ class ActiveSticker(Star):
                 kind="主动发言" if proactive else "聊天回复",
                 speaker="" if proactive else event.get_sender_name()[:100],
                 group_chat=bool(event.get_group_id()),
+                pack_id=pack_id,
             ),
         )
+        await self.save_sent_stickers()
 
-    def include_sent_stickers(self, request, sent_stickers):
-        count = len(self.library.available())
+    def include_sent_stickers(self, request, sent_stickers, pack_id=None):
+        count = len(self.library.available(pack_id)) if pack_id != "" else 0
         notes = []
         if count:
             if CHAT_EXPRESSION_PROMPT not in (request.system_prompt or ""):
@@ -299,6 +329,12 @@ class ActiveSticker(Star):
                 "正常回复后会自动进入表情意图判断与检索选图，无需在主对话调用工具。"
                 "微信原生收藏的查询结果只描述原生收藏，不影响这里的可用图片。"
             )
+            if pack_id:
+                notes.append(
+                    "当前短期对话只使用风格包："
+                    + self.library.packs[pack_id].name
+                    + "。没有贴切图片可以不发，风格包不决定你的性格或表达意愿。"
+                )
         replies = {}
         for sent in sent_stickers:
             entry = replies.setdefault(
@@ -366,7 +402,7 @@ class ActiveSticker(Star):
         delivered_text = (result.get_plain_text() or "").strip()
         turn.reply = (delivered_text or turn.reply)[-3500:]
         turn.reply_images = any(isinstance(part, Image) for part in result.chain)
-        if not turn.reply or not self.library.available():
+        if not turn.reply or not turn.pack_id or not self.library.available(turn.pack_id):
             return
         turn.scheduled = True
         task = asyncio.create_task(self.express(event, turn))
@@ -431,13 +467,18 @@ class ActiveSticker(Star):
             for _ in range(3):
                 if not self.current(turn):
                     return
-                candidates, entries = self.library.search_index.search(query, categories, exclude=seen)
+                search_index = self.library.pack_indexes.get(turn.pack_id)
+                if search_index is None or not search_index.items:
+                    return
+                candidates, entries = search_index.search(query, categories, exclude=seen)
                 seen.update(item.id for item in candidates)
                 scene.update(
                     {
                         "我已决定的表达意图": meaning,
                         "本组可用图片数上限": max_images,
-                        "分类文档目录": self.library.search_index.documents(),
+                        "当前风格包": self.library.packs[turn.pack_id].name,
+                        "选图约束": "只使用当前风格包。没有贴切素材就不发，不跨包补图。",
+                        "分类文档目录": search_index.documents(),
                         "本次检索": {"query": query, "categories": categories},
                         "文档匹配条目": entries,
                     }
@@ -465,7 +506,16 @@ class ActiveSticker(Star):
                 if not self.current(turn):
                     break
                 item = self.library.items.get(ident)
-                if not item or not item.enabled or not item.description or not self.library.path(item).is_file():
+                pack = self.library.packs.get(turn.pack_id)
+                if (
+                    not pack
+                    or not pack.enabled
+                    or not item
+                    or item.pack_id != turn.pack_id
+                    or not item.enabled
+                    or not item.description
+                    or not self.library.path(item).is_file()
+                ):
                     continue
                 delivered = await asyncio.wait_for(
                     event.send(
@@ -542,6 +592,9 @@ class ActiveSticker(Star):
                     self.index_errors[ident] = f"识图失败（{type(error).__name__}），可重试或手动填写"
             finally:
                 self.pending.pop(ident, None)
+                latest = self.library.items.get(ident)
+                if latest is not None and latest is not item and latest.enabled and not latest.description:
+                    self.queue_index([latest])
 
     async def web_settings(self):
         providers = []
@@ -600,6 +653,14 @@ class ActiveSticker(Star):
                 ],
                 "vision_configured": bool(self.vision_provider()),
                 "categories": list(CATEGORIES),
+                "packs": [
+                    {
+                        **asdict(pack),
+                        "count": sum(item.pack_id == pack.id for item in self.library.items.values()),
+                        "ready": len(self.library.pack_indexes[pack.id].items),
+                    }
+                    for pack in self.library.packs.values()
+                ],
             }
         )
 
@@ -639,6 +700,14 @@ class ActiveSticker(Star):
         values = fields(data)
         if "categories" not in data:
             values["categories"] = item.categories
+        pack_id = data.get("pack_id", item.pack_id)
+        if not isinstance(pack_id, str) or pack_id not in self.library.packs:
+            return error_response("找不到风格包", status_code=400)
+        values["pack_id"] = pack_id
+        if "name" in data:
+            if not isinstance(data["name"], str) or not data["name"].strip():
+                return error_response("请填写图片名称", status_code=400)
+            values["name"] = " ".join(data["name"].split())[:160]
         self.library.update(item, **values, enabled=data["enabled"])
         self.index_errors.pop(item.id, None)
         return json_response({"saved": True})
@@ -672,3 +741,60 @@ class ActiveSticker(Star):
 
     async def web_catalog(self):
         return file_response(self.library.root / "catalog.md", filename="catalog.md", content_type="text/markdown")
+
+    async def web_save_pack(self):
+        data = await request.json(default={})
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("name"), str)
+            or not isinstance(data.get("description", ""), str)
+            or type(data.get("enabled", True)) is not bool
+            or ("id" in data and not isinstance(data["id"], str))
+        ):
+            return error_response("风格包信息无效", status_code=400)
+        try:
+            pack = self.library.save_pack(
+                data["name"], data.get("description", ""), data.get("enabled", True), data.get("id")
+            )
+        except ValueError as error:
+            return error_response(str(error), status_code=400)
+        return json_response({"pack": asdict(pack)})
+
+    async def web_delete_pack(self):
+        data = await request.json(default={})
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            return error_response("缺少风格包 ID", status_code=400)
+        try:
+            self.library.delete_pack(data["id"])
+        except ValueError as error:
+            return error_response(str(error), status_code=400)
+        self.index_unrecognized()
+        return json_response({"deleted": True})
+
+    async def web_organize(self):
+        data = await request.json(default={})
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("ids"), list)
+            or not all(isinstance(ident, str) for ident in data["ids"])
+            or not ("pack_id" in data or "enabled" in data)
+            or ("pack_id" in data and not isinstance(data["pack_id"], str))
+            or ("enabled" in data and type(data["enabled"]) is not bool)
+        ):
+            return error_response("整理请求无效", status_code=400)
+        try:
+            self.library.organize(data["ids"], pack_id=data.get("pack_id"), enabled=data.get("enabled"))
+        except ValueError as error:
+            return error_response(str(error), status_code=400)
+        self.index_unrecognized()
+        return json_response({"saved": True})
+
+    async def web_export_pack(self):
+        ident = request.query.get("id", DEFAULT_PACK)
+        if ident not in self.library.packs:
+            return error_response("找不到风格包", status_code=404)
+        snapshot = self.library.pack_snapshot(ident)
+        path = await asyncio.to_thread(self.library.export_pack, ident, snapshot)
+        response = file_response(path, filename=f"stickers-{ident}.zip", content_type="application/zip")
+        response.background = BackgroundTask(path.unlink, missing_ok=True)
+        return response

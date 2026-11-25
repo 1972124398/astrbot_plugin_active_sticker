@@ -32,6 +32,22 @@
     "min": 1,
     "max": 20
   },
+  "pack_idle_minutes": {
+    "description": "风格包刷新所需空闲分钟数",
+    "hint": "连续聊天保持同一包；距上次对话超过此时间后，下次对话才尝试换包。",
+    "type": "int",
+    "default": 360,
+    "min": 1,
+    "max": 10080
+  },
+  "pack_switch_percent": {
+    "description": "空闲后更换风格包的概率（%）",
+    "hint": "0 表示保持原包，100 表示有其他可用包时必换。每次空闲结束只判断一次。",
+    "type": "int",
+    "default": 50,
+    "min": 0,
+    "max": 100
+  },
   "interop_enabled": {
     "description": "启用可选联动",
     "type": "bool",

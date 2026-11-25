@@ -3,6 +3,8 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from astrbot.core.message.message_event_result import ResultContentType
 from astrbot_plugin_active_sticker.expression import CHAT_EXPRESSION_PROMPT, INTENT_PROMPT, selected_ids
 from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
 from astrbot_plugin_active_sticker.main import ActiveSticker
+from astrbot_plugin_active_sticker.styles import choose_pack
 from PIL import Image
 
 
@@ -391,3 +394,205 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         first.save(path, save_all=True, append_images=[second])
         with Image.open(io.BytesIO(vision_image(path))) as strips:
             self.assertEqual(strips.size, (48, 24))
+
+    def test_legacy_library_migrates_without_losing_images_or_descriptions(self):
+        from dataclasses import asdict
+
+        row = asdict(self.item)
+        row.pop("pack_id")
+        self.library.index.write_text(json.dumps([row]), "utf-8")
+        migrated = StickerLibrary(self.library.root)
+        self.assertEqual(migrated.items[self.item.id].pack_id, "default")
+        self.assertEqual(migrated.available(), (self.item,))
+        pack = migrated.save_pack("猫猫", "猫猫风格")
+        migrated.organize([self.item.id], pack_id=pack.id)
+        reloaded = StickerLibrary(self.library.root)
+        self.assertEqual(reloaded.items[self.item.id].pack_id, pack.id)
+        self.assertEqual(reloaded.packs[pack.id].name, "猫猫")
+
+    def test_pack_management_preserves_files_and_exports_reviewable_metadata(self):
+        pack = self.library.save_pack("猫猫")
+        self.library.organize([self.item.id], pack_id=pack.id, enabled=False)
+        with zipfile.ZipFile(self.library.export_pack(pack.id)) as archive:
+            manifest = json.loads(archive.read("pack.json"))
+            self.assertFalse(manifest["items"][0]["enabled"])
+            self.assertEqual(manifest["items"][0]["description"], self.item.description)
+            self.assertIn(f"images/{self.item.id}.png", archive.namelist())
+        self.library.delete_pack(pack.id)
+        self.assertEqual(self.library.items[self.item.id].pack_id, "default")
+        self.assertTrue(self.library.path(self.item).is_file())
+        with self.assertRaises(ValueError):
+            self.library.delete_pack("default")
+        with self.assertRaises(ValueError):
+            self.library.save_pack("未分组")
+        with self.assertRaises(ValueError):
+            self.library.organize(["missing", self.item.id], enabled=True)
+        self.assertFalse(self.library.items[self.item.id].enabled)
+
+    def test_idle_refresh_rolls_once_and_keeps_continuous_dialogue_in_one_pack(self):
+        leases = OrderedDict()
+        with (
+            patch("astrbot_plugin_active_sticker.styles.random.choice", side_effect=lambda choices: choices[0]),
+            patch("astrbot_plugin_active_sticker.styles.random.random", return_value=0.25) as roll,
+        ):
+            self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 0, 21600, 0.5), "a")
+            self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 21000, 21600, 0.5), "a")
+            self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 22000, 21600, 0.5), "a")
+            roll.assert_not_called()
+            self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 43600, 21600, 0.5), "b")
+            self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 43601, 21600, 0.5), "b")
+            roll.assert_called_once()
+            self.assertEqual(choose_pack(leases, "other-persona", ["a", "b"], 43601, 21600, 0.5), "a")
+
+    def test_zero_probability_one_pack_and_unavailable_pack_recovery(self):
+        leases = OrderedDict()
+        self.assertEqual(choose_pack(leases, "chat", ["a"], 0, 1, 1), "a")
+        self.assertEqual(choose_pack(leases, "chat", ["a"], 2, 1, 1), "a")
+        self.assertEqual(choose_pack(leases, "chat", ["a", "b"], 4, 1, 0), "a")
+        self.assertEqual(choose_pack(leases, "chat", ["b"], 5, 1, 0), "b")
+        self.assertEqual(choose_pack(leases, "chat", [], 6, 1, 0), "")
+
+    async def test_locked_pack_filters_every_search_and_rejects_foreign_model_ids(self):
+        pack = self.library.save_pack("另一种画风")
+        data = sticker_image("blue")
+        foreign, _ = self.library.add("外包.png", data, inspect_image(data), pack_id=pack.id)
+        foreign = self.library.update(foreign, description="爆笑", categories=("开心",))
+        self.expression_model([foreign.id])
+        event = Event()
+        with patch("astrbot_plugin_active_sticker.styles.random.choice", return_value="default"):
+            await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        prompt = json.loads(self.context.llm_generate.await_args.kwargs["prompt"])
+        self.assertNotIn(foreign.id, json.dumps(prompt))
+        self.assertEqual({entry["id"] for entry in prompt["文档匹配条目"]}, {self.item.id})
+        event.send.assert_not_called()
+
+    async def test_moving_or_disabling_chosen_pack_during_selection_prevents_delivery(self):
+        pack = self.library.save_pack("另一种画风")
+        for operation in ("move", "disable"):
+            with self.subTest(operation=operation):
+                self.library.organize([self.item.id], pack_id="default")
+                self.library.save_pack("未分组", enabled=True, ident="default")
+
+                async def respond(**kwargs):
+                    if kwargs["system_prompt"] == INTENT_PROMPT:
+                        return SimpleNamespace(completion_text='{"want":true,"meaning":"爆笑"}')
+                    if operation == "move":
+                        self.library.organize([self.item.id], pack_id=pack.id)
+                    else:
+                        self.library.save_pack("未分组", enabled=False, ident="default")
+                    return SimpleNamespace(completion_text=json.dumps({"send": [self.item.id]}))
+
+                self.context.llm_generate.side_effect = respond
+                event = Event()
+                await self.plugin.capture(event, ProviderRequest())
+                await self.plugin.after_reply(event)
+                await asyncio.gather(*list(self.plugin.tasks))
+                event.send.assert_not_called()
+
+    async def test_pack_choice_is_saved_even_when_ai_declines_expression(self):
+        pack = self.library.save_pack("猫猫")
+        self.library.organize([self.item.id], pack_id=pack.id)
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest())
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"want":false}')
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        with patch("astrbot_plugin_active_sticker.main.StarTools.get_data_dir", return_value=self.library.root):
+            reloaded = ActiveSticker(self.context, self.plugin.config)
+        self.addAsyncCleanup(reloaded.terminate)
+        self.assertFalse(next(iter(reloaded.sessions.values())).history)
+        self.assertEqual(next(iter(next(iter(reloaded.sessions.values())).packs.values())).pack_id, pack.id)
+
+    async def test_default_idle_is_six_hours_and_missing_original_recovers_at_next_turn(self):
+        pack = self.library.save_pack("猫猫")
+        data = sticker_image("blue")
+        other, _ = self.library.add("另一包.png", data, inspect_image(data), pack_id=pack.id)
+        self.library.update(other, description="笑出声")
+        self.plugin.config["pack_switch_percent"] = 100
+        with (
+            patch("astrbot_plugin_active_sticker.styles.random.choice", side_effect=lambda choices: choices[0]),
+            patch("astrbot_plugin_active_sticker.main.time.time", return_value=100),
+        ):
+            first = Event()
+            await self.plugin.capture(first, ProviderRequest())
+        self.assertEqual(first.get_extra("astrbot_plugin_active_sticker.turn").pack_id, "default")
+        with patch("astrbot_plugin_active_sticker.main.time.time", return_value=100 + 21599):
+            second = Event()
+            await self.plugin.capture(second, ProviderRequest())
+        self.assertEqual(second.get_extra("astrbot_plugin_active_sticker.turn").pack_id, "default")
+        with patch("astrbot_plugin_active_sticker.main.time.time", return_value=100 + 21599 + 21600):
+            third = Event()
+            await self.plugin.capture(third, ProviderRequest())
+        self.assertEqual(third.get_extra("astrbot_plugin_active_sticker.turn").pack_id, pack.id)
+        self.library.path(other).unlink()
+        fourth = Event()
+        await self.plugin.capture(fourth, ProviderRequest())
+        self.assertEqual(fourth.get_extra("astrbot_plugin_active_sticker.turn").pack_id, "default")
+
+    async def test_all_packs_disabled_advertises_no_available_sticker_capability(self):
+        self.library.save_pack("未分组", enabled=False, ident="default")
+        request = ProviderRequest(system_prompt="原人格")
+        event = Event()
+        await self.plugin.capture(event, request)
+        await self.plugin.after_reply(event)
+        self.assertEqual(request.system_prompt, "原人格")
+        self.context.llm_generate.assert_not_called()
+
+    async def test_export_snapshot_survives_pack_deletion_and_download_is_cleaned(self):
+        pack = self.library.save_pack("猫猫")
+        self.library.organize([self.item.id], pack_id=pack.id)
+        snapshot = self.library.pack_snapshot(pack.id)
+        self.library.delete_pack(pack.id)
+        path = await asyncio.to_thread(self.library.export_pack, pack.id, snapshot)
+        with zipfile.ZipFile(path) as archive:
+            self.assertEqual(json.loads(archive.read("pack.json"))["items"][0]["pack_id"], pack.id)
+            self.assertIn(f"images/{self.item.id}.png", archive.namelist())
+        request = SimpleNamespace(query={"id": "default"})
+        with patch("astrbot_plugin_active_sticker.main.request", request):
+            response = await self.plugin.web_export_pack()
+        self.assertTrue(Path(response.path).is_file())
+        await response.background()
+        self.assertFalse(Path(response.path).exists())
+
+    async def test_moving_unrecognized_image_requeues_without_losing_manual_pack(self):
+        pack = self.library.save_pack("猫猫")
+        item = self.library.update(self.item, description="")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def respond(**_):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(completion_text='{"description":"识图描述"}')
+
+        self.context.llm_generate.side_effect = respond
+        self.plugin.queue_index([item])
+        await asyncio.wait_for(started.wait(), 3)
+        self.library.organize([item.id], pack_id=pack.id)
+        release.set()
+        await self.plugin.worker
+        self.assertEqual(self.library.items[item.id].description, "识图描述")
+        self.assertEqual(self.library.items[item.id].pack_id, pack.id)
+
+    async def test_management_endpoints_reject_bad_batches_and_keep_unknown_fields_safe(self):
+        request = SimpleNamespace(json=AsyncMock(return_value={"name": "猫猫"}))
+        with patch("astrbot_plugin_active_sticker.main.request", request):
+            response = await self.plugin.web_save_pack()
+            pack = json.loads(response.body)["pack"]
+            request.json.return_value = {"ids": [self.item.id], "pack_id": pack["id"]}
+            self.assertEqual((await self.plugin.web_organize()).status_code, 200)
+            self.assertEqual(self.library.items[self.item.id].pack_id, pack["id"])
+            for invalid in (
+                {"ids": [self.item.id], "enabled": "false"},
+                {"ids": [self.item.id], "pack_id": []},
+                {"ids": []},
+                {"ids": [self.item.id, "missing"], "enabled": False},
+            ):
+                request.json.return_value = invalid
+                self.assertEqual((await self.plugin.web_organize()).status_code, 400)
+            self.assertTrue(self.library.items[self.item.id].enabled)
+            request.json.return_value = {"id": pack["id"]}
+            self.assertEqual((await self.plugin.web_delete_pack()).status_code, 200)
+            self.assertTrue(self.library.path(self.item).is_file())

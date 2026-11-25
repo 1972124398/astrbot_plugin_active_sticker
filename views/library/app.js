@@ -10,6 +10,11 @@ let importing = false;
 let visionReady = false;
 let visible = 30;
 let refreshGeneration = 0;
+let packs = [];
+let activePack = "";
+let editingPack;
+let organizing = false;
+const selected = new Set();
 const thumbnails = new Map();
 
 function report(message, target = $("notice")) {
@@ -18,7 +23,7 @@ function report(message, target = $("notice")) {
 }
 
 function itemStatus(item) {
-  if (!item.enabled) return "disabled";
+  if (!item.enabled || packs.find((pack) => pack.id === item.pack_id)?.enabled === false) return "disabled";
   return item.description && !item.missing ? "ready" : "waiting";
 }
 
@@ -79,22 +84,76 @@ function openItem(item) {
   $("tags").value = item.tags.join("、");
   $("categories").value = (item.categories || []).join("、");
   $("enabled").checked = item.enabled;
+  $("edit-name").value = item.name;
+  $("edit-item-pack").value = item.pack_id;
   $("identify").disabled = item.pending || item.missing || !visionReady;
   report("", $("edit-error"));
   editor.showModal();
 }
 
-function render() {
+function filteredItems() {
   const query = $("search").value.trim().toLowerCase();
   const state = $("status").value;
   const category = $("category").value;
-  const filtered = items.filter((item) => {
+  return items.filter((item) => {
     const haystack = [item.name, item.description, item.use_when, ...item.tags].join(" ").toLowerCase();
-    return (!state || itemStatus(item) === state) && (!query || haystack.includes(query))
+    return (!activePack || item.pack_id === activePack)
+      && (!state || itemStatus(item) === state) && (!query || haystack.includes(query))
       && (!category || (item.categories || []).includes(category));
   });
+}
+
+function updateSelection() {
+  const filtered = filteredItems();
+  $("selected-count").textContent = "已选 " + selected.size + " 张";
+  $("select-all").checked = filtered.length > 0 && filtered.every((item) => selected.has(item.id));
+  $("select-all").indeterminate = filtered.some((item) => selected.has(item.id)) && !$("select-all").checked;
+  for (const id of ["move-selected", "enable-selected", "disable-selected", "clear-selected"]) {
+    $(id).disabled = !selected.size || organizing;
+  }
+}
+
+function renderPacks() {
+  const options = [{ id: "", name: "全部表情", count: items.length, ready: items.filter((item) => itemStatus(item) === "ready").length }, ...packs];
+  $("pack-list").replaceChildren(...options.map((pack) => {
+    const button = element("button", "", "pack-card");
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(activePack === pack.id));
+    button.append(element("strong", pack.name), element("span", pack.count + " 张 · " + pack.ready + " 张可用"));
+    if (pack.enabled === false) button.append(element("small", "已停用"));
+    button.addEventListener("click", () => {
+      activePack = pack.id;
+      visible = 30;
+      selected.clear();
+      if (activePack) $("import-pack").value = activePack;
+      render();
+    });
+    return button;
+  }));
+  const pack = packs.find((entry) => entry.id === activePack);
+  $("edit-pack").hidden = !pack;
+  $("export-pack").hidden = !pack;
+  $("pack-detail").textContent = pack ? (pack.description || "同一包内的图片会一起参与当前风格的选图。") : "选择一个风格包查看，或勾选图片批量整理。";
+  const importPack = packs.find((entry) => entry.id === $("import-pack").value);
+  $("drop").querySelector("strong").textContent = "导入表情到「" + (importPack?.name || "未分组") + "」";
+}
+
+function render() {
+  const filtered = filteredItems();
   observer.disconnect();
   const cards = filtered.slice(0, visible).map((item) => {
+    const wrapper = element("article", "", "sticker-tile");
+    const checkLabel = element("label", "", "tile-check check");
+    const checkbox = element("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected.has(item.id);
+    checkbox.setAttribute("aria-label", "选择 " + item.name);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selected.add(item.id);
+      else selected.delete(item.id);
+      updateSelection();
+    });
+    checkLabel.append(checkbox, element("span", packs.find((pack) => pack.id === item.pack_id)?.name || "未分组"));
     const card = element("button", "", "card");
     card.type = "button";
     const picture = element("span", item.missing ? "无法预览" : "预览", "picture");
@@ -104,7 +163,8 @@ function render() {
     card.append(element("small", [statusText(item), item.animated ? "动图" : ""].filter(Boolean).join(" · ")));
     card.addEventListener("click", () => openItem(item));
     if (!item.missing) observer.observe(picture);
-    return card;
+    wrapper.append(checkLabel, card);
+    return wrapper;
   });
   gallery.replaceChildren(...cards);
   $("more").hidden = filtered.length <= visible;
@@ -112,8 +172,19 @@ function render() {
   $("empty").textContent = items.length ? "没有符合筛选的表情。" : "导入图片后，这里会显示预览和识图描述。";
   const ready = items.filter((item) => itemStatus(item) === "ready").length;
   const pending = items.filter((item) => item.pending).length;
-  $("counts").textContent = items.length + " 张图片 · " + ready + " 张可用" + (pending ? " · " + pending + " 张识图中" : "");
+  $("counts").textContent = "当前 " + filtered.length + " / " + items.length + " 张 · 全库 " + ready + " 张可用" + (pending ? " · " + pending + " 张识图中" : "");
   $("retry").disabled = !visionReady || !items.some((item) => itemStatus(item) === "waiting" && !item.pending && !item.missing);
+  renderPacks();
+  updateSelection();
+}
+
+function packOptions() {
+  for (const id of ["import-pack", "move-pack", "edit-item-pack"]) {
+    const input = $(id);
+    const old = input.value;
+    input.replaceChildren(...packs.map((pack) => new Option(pack.name + (pack.enabled ? "" : "（已停用）"), pack.id)));
+    input.value = packs.some((pack) => pack.id === old) ? old : "default";
+  }
 }
 
 async function refresh() {
@@ -128,9 +199,14 @@ async function refresh() {
       }
     }
     if (generation !== refreshGeneration) return;
-    const changed = snapshot.vision_configured !== visionReady || JSON.stringify(snapshot.items) !== JSON.stringify(items);
+    const changed = snapshot.vision_configured !== visionReady || JSON.stringify(snapshot.items) !== JSON.stringify(items)
+      || JSON.stringify(snapshot.packs) !== JSON.stringify(packs);
     visionReady = snapshot.vision_configured;
     items = snapshot.items;
+    packs = snapshot.packs;
+    if (activePack && !packs.some((pack) => pack.id === activePack)) activePack = "";
+    for (const id of selected) if (!items.some((item) => item.id === id)) selected.delete(id);
+    if (changed) packOptions();
     if (changed || gallery.childElementCount === 0) render();
     $("vision-hint").hidden = visionReady;
     if (items.some((item) => item.pending) || importing) timer = window.setTimeout(refresh, 1800);
@@ -146,6 +222,7 @@ async function importFiles(files) {
   let added = 0;
   let duplicates = 0;
   const errors = [];
+  const targetPack = $("import-pack").value;
   try {
     for (const [index, file] of [...files].entries()) {
       report("导入 " + (index + 1) + " / " + files.length + " · " + file.name);
@@ -154,6 +231,14 @@ async function importFiles(files) {
         thumbnails.delete(result.id);
         if (result.added) added++;
         else duplicates++;
+        // Duplicate imports keep their existing manual organization.
+        if (result.added && targetPack !== "default") {
+          try {
+            await bridge.apiPost("organize", { ids: [result.id], pack_id: targetPack });
+          } catch (error) {
+            errors.push(file.name + " 已导入未分组，移动失败：" + error.message);
+          }
+        }
       } catch (error) {
         errors.push(file.name + " · " + error.message);
       }
@@ -204,6 +289,8 @@ $("save").addEventListener("click", () => {
     use_when: $("usage").value,
     tags: $("tags").value,
     categories: $("categories").value,
+    name: $("edit-name").value,
+    pack_id: $("edit-item-pack").value,
     enabled: $("enabled").checked,
   }), $("edit-error"));
 });
@@ -224,12 +311,83 @@ $("retry").addEventListener("click", () => action(async () => {
 }));
 $("export").addEventListener("click", () => action(() => bridge.download("catalog", {}, "catalog.md")));
 
+$("import-pack").addEventListener("change", renderPacks);
+$("select-all").addEventListener("change", () => {
+  for (const item of filteredItems()) {
+    if ($("select-all").checked) selected.add(item.id);
+    else selected.delete(item.id);
+  }
+  render();
+});
+$("clear-selected").addEventListener("click", () => { selected.clear(); render(); });
+async function organize(payload) {
+  if (organizing || !selected.size) return;
+  organizing = true;
+  updateSelection();
+  const ids = [...selected];
+  try {
+    await bridge.apiPost("organize", { ids, ...payload });
+    for (const id of ids) selected.delete(id);
+    report("已整理 " + ids.length + " 张表情");
+    await refresh();
+  } finally {
+    organizing = false;
+    updateSelection();
+  }
+}
+$("move-selected").addEventListener("click", () => action(() => organize({ pack_id: $("move-pack").value })));
+$("enable-selected").addEventListener("click", () => action(() => organize({ enabled: true })));
+$("disable-selected").addEventListener("click", () => action(() => organize({ enabled: false })));
+function openPack(pack) {
+  editingPack = pack;
+  $("pack-editor-title").textContent = pack ? "管理风格包" : "新建风格包";
+  $("pack-name").value = pack?.name || "";
+  $("pack-description").value = pack?.description || "";
+  $("pack-enabled").checked = pack?.enabled ?? true;
+  $("delete-pack").hidden = !pack || pack.id === "default";
+  $("pack-delete-confirmation").hidden = true;
+  report("", $("pack-error"));
+  $("pack-editor").showModal();
+}
+$("new-pack").addEventListener("click", () => openPack());
+$("edit-pack").addEventListener("click", () => openPack(packs.find((pack) => pack.id === activePack)));
+$("close-pack").addEventListener("click", () => $("pack-editor").close());
+$("save-pack").addEventListener("click", () => {
+  if (!$("pack-name").reportValidity()) return;
+  action(async () => {
+    $("save-pack").disabled = true;
+    try {
+      const data = { name: $("pack-name").value, description: $("pack-description").value, enabled: $("pack-enabled").checked };
+      if (editingPack) data.id = editingPack.id;
+      const { pack } = await bridge.apiPost("packs/save", data);
+      activePack = pack.id;
+      selected.clear();
+      $("pack-editor").close();
+      await refresh();
+      $("import-pack").value = pack.id;
+      renderPacks();
+    } finally { $("save-pack").disabled = false; }
+  }, $("pack-error"));
+});
+$("delete-pack").addEventListener("click", () => { $("pack-delete-confirmation").hidden = false; });
+$("cancel-delete-pack").addEventListener("click", () => { $("pack-delete-confirmation").hidden = true; });
+$("confirm-delete-pack").addEventListener("click", () => action(async () => {
+  await bridge.apiPost("packs/delete", { id: editingPack.id });
+  $("pack-editor").close();
+  activePack = "default";
+  await refresh();
+  report("风格包已删除，图片已移回未分组");
+}, $("pack-error")));
+$("export-pack").addEventListener("click", () => action(() => bridge.download("packs/export", { id: activePack }, "stickers-" + activePack + ".zip")));
+
 const settingInputs = {
   enabled: $("auto-enabled"),
   vision_provider_id: $("vision_provider_id"),
   expression_provider_id: $("expression_provider_id"),
   expression_style: $("expression_style"),
   burst_limit: $("burst_limit"),
+  pack_idle_minutes: $("pack_idle_hours"),
+  pack_switch_percent: $("pack_switch_percent"),
   interop_enabled: $("interop_enabled"),
   link_short_term_mood: $("link_short_term_mood"),
   link_self_cognition: $("link_self_cognition"),
@@ -268,7 +426,7 @@ async function loadSettings() {
     providerOptions(settingInputs.expression_provider_id, providers, values.expression_provider_id, "跟随会话模型");
     for (const [key, input] of Object.entries(settingInputs)) {
       if (input.type === "checkbox") input.checked = values[key];
-      else input.value = values[key];
+      else input.value = key === "pack_idle_minutes" ? values[key] / 60 : values[key];
     }
     $("provider-note").hidden = providers.length > 0;
     updateLinkToggles();
@@ -295,12 +453,13 @@ function showTab(selected) {
 }
 
 async function saveSettings() {
-  if (!savedSettings || !settingInputs.burst_limit.reportValidity()) return;
+  if (!savedSettings || Object.values(settingInputs).some((input) => !input.reportValidity())) return;
   const changed = {};
   for (const [key, input] of Object.entries(settingInputs)) {
     let value = input.value;
     if (input.type === "checkbox") value = input.checked;
     if (input.type === "number") value = input.valueAsNumber;
+    if (key === "pack_idle_minutes") value = Math.max(1, Math.round(value * 60));
     if (value !== savedSettings[key]) changed[key] = value;
   }
   const button = $("settings-save");

@@ -66,6 +66,25 @@ button:disabled { opacity: .55; cursor: default; }
 .toolbar input { min-width: 140px; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(188px, 1fr)); gap: 12px; }
 .card { display: grid; gap: 8px; text-align: left; padding: 10px; align-content: start; }
+.pack-section { margin-bottom: 24px; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+.pack-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.eyebrow { color: var(--accent); font-size: 12px; margin-bottom: 8px; letter-spacing: .06em; }
+.pack-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 10px; margin: 18px 0 8px; }
+.pack-card { display: grid; gap: 8px; text-align: left; padding: 16px; }
+.pack-card span, .pack-card small { font-size: 12px; color: var(--muted); }
+.pack-card[aria-pressed="true"] { background: var(--tint); border-color: var(--accent); box-shadow: inset 3px 0 var(--accent); }
+.pack-card strong { overflow-wrap: anywhere; }
+.import-target { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.organize-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 12px; margin-bottom: 16px; background: var(--tint); border-radius: 10px; font-size: 12px; }
+.organize-bar button, .organize-bar select { padding: 6px 9px; }
+.sticker-tile { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.tile-check { padding: 10px 12px 0; font-size: 12px; color: var(--muted); }
+.tile-check span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile-check input { accent-color: var(--accent); }
+.sticker-tile:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.sticker-tile .card { width: 100%; border: 0; border-radius: 0; }
+.sticker-tile .card:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.pack-form { display: grid; gap: 16px; }
 .picture {
   height: 122px;
   display: grid;
@@ -164,4 +183,7 @@ textarea { resize: vertical; }
 @media (max-width: 560px) {
   .model-fields { grid-template-columns: 1fr; }
   .panel-header { gap: 12px; }
+  .pack-section { padding: 16px; }
+  .pack-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pack-card { padding: 12px; }
 }
