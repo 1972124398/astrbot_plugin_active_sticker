@@ -36,6 +36,8 @@ CSV_FIELDS = (
     "自动识图语气",
     "图中文字",
     "自动识图误用限制",
+    "导入时间（UTC）",
+    "导入时间来源",
 )
 
 
@@ -91,6 +93,12 @@ def csv_bytes(snapshot):
             retrieval.get("tone", ""),
             retrieval.get("text", ""),
             retrieval.get("avoid", ""),
+            item.get("imported_at", ""),
+            "文件时间估算"
+            if item.get("import_time_estimated")
+            else "导入记录"
+            if item.get("imported_at")
+            else "未知",
         )
         writer.writerow(csv_cell(value) for value in values)
     # BOM allows Excel to recognize Chinese text when the CSV is opened directly.

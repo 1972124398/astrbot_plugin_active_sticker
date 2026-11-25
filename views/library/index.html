@@ -56,11 +56,23 @@
       </select>
       <select id="category" aria-label="按用途筛选"><option value="">全部表达用途</option></select>
     </section>
+    <section class="time-toolbar" aria-label="按时间筛选">
+      <label>时间依据<select id="time-field"><option value="imported">导入时间</option><option value="recognized">最近成功识图时间</option></select></label>
+      <label>时间范围<select id="time-range"><option value="all">全部时间</option><option value="today">今天</option><option value="24h">近 24 小时</option><option value="7d">近 7 天</option><option value="30d">近 30 天</option><option value="custom">自定义时段</option><option value="unknown">时间未知</option></select></label>
+      <label id="time-from-label" hidden>开始时间<input id="time-from" type="datetime-local" aria-describedby="time-hint"></label>
+      <label id="time-to-label" hidden>结束时间<input id="time-to" type="datetime-local" aria-describedby="time-hint"></label>
+      <label>排序<select id="time-order"><option value="newest">从新到旧</option><option value="oldest">从旧到新</option></select></label>
+      <button id="reset-time" type="button">重置时间</button>
+    </section>
+    <p id="time-hint" class="muted" role="status">按浏览器本地时间筛选；旧图导入时间以文件时间估算并标记「约」。</p>
     <section class="organize-bar" aria-label="批量整理">
       <label class="check"><input id="select-all" type="checkbox">选择筛选结果</label><span id="selected-count" aria-live="polite">已选 0 张</span>
+      <button id="selection-mode" type="button" aria-pressed="false">批量选择</button><button id="range-select" type="button" aria-pressed="false">连续选择</button>
+      <button id="select-visible" type="button">选当前显示</button><button id="invert-selection" type="button">反选筛选结果</button>
       <select id="move-pack" aria-label="移动到风格包"></select><button id="move-selected" type="button">移动</button>
       <button id="enable-selected" type="button">启用</button><button id="disable-selected" type="button">停用</button><button id="clear-selected" type="button">清空选择</button>
     </section>
+    <p id="selection-hint" class="muted selection-hint" role="status">勾选第一张后，按住 Shift 点击最后一张可连选；手机可用「连续选择」。切换筛选或排序会清空选择。</p>
     <div id="gallery" class="gallery"></div>
     <p id="empty" class="empty" hidden></p>
     <button id="more" type="button" hidden>显示更多</button>

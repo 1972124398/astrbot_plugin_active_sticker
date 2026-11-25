@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -761,6 +762,50 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.search_index.profiles[self.item.id], profile)
         rows = list(csv.DictReader(io.StringIO(csv_bytes(reloaded.export_snapshot()).decode("utf-8-sig"))))
         self.assertEqual(rows[0]["图中文字"], "哼！")
+
+    def test_new_import_time_is_persisted_and_duplicate_edit_or_move_does_not_change_it(self):
+        item = self.library.items[self.item.id]
+        self.assertTrue(item.imported_at.endswith("+00:00"))
+        self.assertFalse(item.import_time_estimated)
+        pack = self.library.save_pack("新风格")
+        self.library.organize([item.id], pack_id=pack.id)
+        self.library.update(self.library.items[item.id], description="人工修改")
+        duplicate, added = self.library.add("重复.png", sticker_image(), inspect_image(sticker_image()))
+        self.assertFalse(added)
+        self.assertEqual(duplicate.imported_at, item.imported_at)
+        reloaded = StickerLibrary(self.library.root)
+        self.assertEqual(reloaded.items[item.id].imported_at, item.imported_at)
+        rows = list(csv.DictReader(io.StringIO(csv_bytes(reloaded.export_snapshot()).decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["导入时间（UTC）"], item.imported_at)
+        self.assertEqual(rows[0]["导入时间来源"], "导入记录")
+
+    def test_legacy_import_time_is_estimated_once_from_file_and_missing_images_remain_unknown(self):
+        from dataclasses import asdict
+        from datetime import datetime, timezone
+
+        row = asdict(self.item)
+        row.pop("imported_at")
+        row.pop("import_time_estimated")
+        stamp = 1700000000
+        os.utime(self.library.path(self.item), (stamp, stamp))
+        missing = {**row, "id": "0000000000000000"}
+        self.library.index.write_text(json.dumps([row, missing]), "utf-8")
+        reloaded = StickerLibrary(self.library.root)
+        item = reloaded.items[self.item.id]
+        self.assertEqual(
+            item.imported_at, datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
+        )
+        self.assertTrue(item.import_time_estimated)
+        self.assertEqual(reloaded.items[missing["id"]].imported_at, "")
+        self.assertFalse(reloaded.items[missing["id"]].import_time_estimated)
+        self.assertEqual(item.description, self.item.description)
+        self.assertEqual(item.revision, self.item.revision)
+        os.utime(reloaded.path(item), (stamp + 10000, stamp + 10000))
+        again = StickerLibrary(self.library.root)
+        self.assertEqual(again.items[item.id].imported_at, item.imported_at)
+        rows = list(csv.DictReader(io.StringIO(csv_bytes(again.export_snapshot()).decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["导入时间来源"], "文件时间估算")
+        self.assertEqual(rows[1]["导入时间来源"], "未知")
 
     async def test_moving_unrecognized_image_requeues_without_losing_manual_pack(self):
         pack = self.library.save_pack("猫猫")

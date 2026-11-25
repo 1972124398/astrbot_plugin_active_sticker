@@ -45,6 +45,8 @@ class Sticker:
     categories: tuple[str, ...] = ()
     pack_id: str = DEFAULT_PACK
     vision_result: dict | None = None
+    imported_at: str = ""
+    import_time_estimated: bool = False
 
     def summary(self):
         return {
@@ -111,6 +113,7 @@ class StickerLibrary:
         self.index = self.root / "index.json"
         self.items = {}
         self.packs = {DEFAULT_PACK: StickerPack(DEFAULT_PACK, "未分组")}
+        migrated_times = False
         if self.index.exists():
             rows = json.loads(self.index.read_text(encoding="utf-8"))
             if isinstance(rows, dict):
@@ -126,8 +129,19 @@ class StickerLibrary:
                 if STICKER_ID.fullmatch(item.id) and item.extension in FORMATS.values():
                     if item.pack_id not in self.packs:
                         item = replace(item, pack_id=DEFAULT_PACK)
+                    if "imported_at" not in row:
+                        try:
+                            stamp = self.path(item).stat().st_mtime
+                            imported_at = datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="seconds")
+                        except (OSError, ValueError, OverflowError):
+                            imported_at = ""
+                        item = replace(item, imported_at=imported_at, import_time_estimated=bool(imported_at))
+                        migrated_times = True
                     self.items[item.id] = item
-        self.write_catalog()
+        if migrated_times:
+            self.commit(self.items)
+        else:
+            self.write_catalog()
 
     @staticmethod
     def write(path, data):
@@ -218,7 +232,14 @@ class StickerLibrary:
                 self.write_catalog()
             return item, False
         name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()[:160]
-        item = Sticker(ident, name or f"{ident}.{extension}", extension, animated, pack_id=pack_id)
+        item = Sticker(
+            ident,
+            name or f"{ident}.{extension}",
+            extension,
+            animated,
+            pack_id=pack_id,
+            imported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
         self.write(self.path(item), data)
         self.commit({**self.items, ident: item})
         return item, True

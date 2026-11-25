@@ -14,6 +14,10 @@ let packs = [];
 let activePack = "";
 let editingPack;
 let organizing = false;
+let selectionMode = false;
+let rangeSelecting = false;
+let selectionAnchor = null;
+let resultOrder = "";
 const selected = new Set();
 const thumbnails = new Map();
 
@@ -95,21 +99,107 @@ function filteredItems() {
   const query = $("search").value.trim().toLowerCase();
   const state = $("status").value;
   const category = $("category").value;
+  const range = $("time-range").value;
+  const times = new Map(items.map((item) => [item.id, itemTime(item)]));
+  const now = Date.now();
+  let from = -Infinity;
+  let to = Infinity;
+  if (range === "today") {
+    const day = new Date(now);
+    day.setHours(0, 0, 0, 0);
+    from = day.getTime();
+    const next = new Date(day);
+    next.setDate(next.getDate() + 1);
+    to = next.getTime() - 1;
+  }
+  if (["24h", "7d", "30d"].includes(range)) {
+    from = now - { "24h": 1, "7d": 7, "30d": 30 }[range] * 86400000;
+    to = now;
+  }
+  if (range === "custom") {
+    if ($("time-from").value) from = new Date($("time-from").value).getTime();
+    if ($("time-to").value) to = new Date($("time-to").value).getTime() + 59999;
+  }
+  const invalid = from > to || Number.isNaN(from) || Number.isNaN(to);
+  $("time-hint").textContent = invalid ? "开始时间不能晚于结束时间，请调整时段。"
+    : "按浏览器本地时间筛选；旧图导入时间以文件时间估算并标记「约」。";
+  if (invalid) return [];
   return items.filter((item) => {
     const haystack = [item.name, item.description, item.use_when, ...item.tags].join(" ").toLowerCase();
+    const time = times.get(item.id);
+    const matchesTime = range === "all" || (range === "unknown" ? time === null : time !== null && time >= from && time <= to);
     return (!activePack || item.pack_id === activePack)
       && (!state || itemStatus(item) === state) && (!query || haystack.includes(query))
-      && (!category || (item.categories || []).includes(category));
+      && (!category || (item.categories || []).includes(category)) && matchesTime;
+  }).sort((a, b) => {
+    const left = times.get(a.id);
+    const right = times.get(b.id);
+    if (left === null && right !== null) return 1;
+    if (right === null && left !== null) return -1;
+    return (left === right ? 0 : ($("time-order").value === "oldest" ? left - right : right - left))
+      || a.id.localeCompare(b.id);
   });
+}
+
+function itemTime(item) {
+  const raw = $("time-field").value === "recognized" ? item.vision_result?.recognized_at : item.imported_at;
+  const time = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(time) ? time : null;
+}
+
+function clearSelection() {
+  selected.clear();
+  selectionAnchor = null;
+  rangeSelecting = false;
+}
+
+function applySelection(id, checked, extend = false) {
+  if (organizing) return;
+  const ids = filteredItems().map((item) => item.id);
+  const first = ids.indexOf(selectionAnchor);
+  const last = ids.indexOf(id);
+  if (last < 0) return;
+  if ((extend || rangeSelecting) && first >= 0) {
+    for (const ident of ids.slice(Math.min(first, last), Math.max(first, last) + 1)) {
+      if (rangeSelecting || checked) selected.add(ident);
+      else selected.delete(ident);
+    }
+    if (rangeSelecting) rangeSelecting = false;
+  } else {
+    if (checked || rangeSelecting) selected.add(id);
+    else selected.delete(id);
+    selectionAnchor = id;
+  }
+  updateSelection();
 }
 
 function updateSelection() {
   const filtered = filteredItems();
-  $("selected-count").textContent = "已选 " + selected.size + " 张";
+  const inFilter = filtered.filter((item) => selected.has(item.id)).length;
+  $("selected-count").textContent = "已选 " + selected.size + " 张" + (selected.size > inFilter ? "（含 " + (selected.size - inFilter) + " 张筛选外图片）" : "");
   $("select-all").checked = filtered.length > 0 && filtered.every((item) => selected.has(item.id));
   $("select-all").indeterminate = filtered.some((item) => selected.has(item.id)) && !$("select-all").checked;
   for (const id of ["move-selected", "enable-selected", "disable-selected", "clear-selected"]) {
     $(id).disabled = !selected.size || organizing;
+  }
+  for (const id of ["select-all", "selection-mode", "range-select", "select-visible", "invert-selection"]) {
+    $(id).disabled = organizing || (id !== "selection-mode" && !filtered.length);
+  }
+  $("selection-mode").setAttribute("aria-pressed", String(selectionMode));
+  $("selection-mode").textContent = selectionMode ? "退出批量选择" : "批量选择";
+  $("range-select").setAttribute("aria-pressed", String(rangeSelecting));
+  $("range-select").textContent = rangeSelecting ? (selectionAnchor ? "点击最后一张" : "点击第一张") : "连续选择";
+  $("selection-hint").textContent = rangeSelecting ? (selectionAnchor
+    ? "再点最后一张，即可选中当前排序中两张之间的整段图片。" : "请先点第一张图片，再点最后一张。")
+    : selectionMode ? "点击整张卡片切换选中；按住 Shift 可连选。退出批量选择后，点击图片可编辑。"
+      : "勾选第一张后，按住 Shift 点击最后一张可连选；手机可用「连续选择」。切换筛选或排序会清空选择。";
+  for (const tile of gallery.children) {
+    const checkbox = tile.querySelector('input[type="checkbox"]');
+    checkbox.checked = selected.has(tile.dataset.id);
+    checkbox.disabled = organizing;
+    const card = tile.querySelector(".card");
+    if (selectionMode) card.setAttribute("aria-pressed", String(checkbox.checked));
+    else card.removeAttribute("aria-pressed");
   }
 }
 
@@ -124,7 +214,7 @@ function renderPacks() {
     button.addEventListener("click", () => {
       activePack = pack.id;
       visible = 30;
-      selected.clear();
+      clearSelection();
       if (activePack) $("import-pack").value = activePack;
       render();
     });
@@ -140,19 +230,19 @@ function renderPacks() {
 
 function render() {
   const filtered = filteredItems();
+  const order = JSON.stringify(filtered.map((item) => item.id));
+  if (order !== resultOrder) selectionAnchor = null;
+  resultOrder = order;
   observer.disconnect();
   const cards = filtered.slice(0, visible).map((item) => {
     const wrapper = element("article", "", "sticker-tile");
+    wrapper.dataset.id = item.id;
     const checkLabel = element("label", "", "tile-check check");
     const checkbox = element("input");
     checkbox.type = "checkbox";
     checkbox.checked = selected.has(item.id);
     checkbox.setAttribute("aria-label", "选择 " + item.name);
-    checkbox.addEventListener("change", () => {
-      if (checkbox.checked) selected.add(item.id);
-      else selected.delete(item.id);
-      updateSelection();
-    });
+    checkbox.addEventListener("click", (event) => applySelection(item.id, checkbox.checked, event.shiftKey));
     checkLabel.append(checkbox, element("span", packs.find((pack) => pack.id === item.pack_id)?.name || "未分组"));
     const card = element("button", "", "card");
     card.type = "button";
@@ -161,7 +251,16 @@ function render() {
     card.append(picture, element("strong", item.name));
     if (item.description) card.append(element("span", item.description, "summary"));
     card.append(element("small", [statusText(item), item.animated ? "动图" : ""].filter(Boolean).join(" · ")));
-    card.addEventListener("click", () => openItem(item));
+    const time = itemTime(item);
+    const estimated = $("time-field").value === "imported" && item.import_time_estimated;
+    const timeLabel = element("small", ($("time-field").value === "imported" ? "导入 · " : "识图 · ")
+      + (time === null ? "时间未知" : (estimated ? "约 " : "") + new Date(time).toLocaleString()), "item-time");
+    if (estimated) timeLabel.title = "旧图以源文件修改时间估算，不代表实际导入时刻";
+    card.append(timeLabel);
+    card.addEventListener("click", (event) => {
+      if (selectionMode || event.shiftKey) applySelection(item.id, !selected.has(item.id), event.shiftKey);
+      else openItem(item);
+    });
     if (!item.missing) observer.observe(picture);
     wrapper.append(checkLabel, card);
     return wrapper;
@@ -284,9 +383,24 @@ $("drop").addEventListener("drop", (event) => {
   $("drop").classList.remove("dragging");
   importFiles(event.dataTransfer.files);
 });
-for (const id of ["search", "status", "category"]) {
-  $(id).addEventListener("input", () => { visible = 30; render(); });
+function changeFilters() {
+  visible = 30;
+  clearSelection();
+  $("time-from-label").hidden = $("time-range").value !== "custom";
+  $("time-to-label").hidden = $("time-range").value !== "custom";
+  render();
 }
+for (const id of ["search", "status", "category", "time-field", "time-range", "time-from", "time-to", "time-order"]) {
+  $(id).addEventListener("input", changeFilters);
+}
+$("reset-time").addEventListener("click", () => {
+  $("time-field").value = "imported";
+  $("time-range").value = "all";
+  $("time-order").value = "newest";
+  $("time-from").value = "";
+  $("time-to").value = "";
+  changeFilters();
+});
 $("more").addEventListener("click", () => { visible += 30; render(); });
 $("close").addEventListener("click", () => editor.close());
 $("save").addEventListener("click", () => {
@@ -341,12 +455,43 @@ $("select-all").addEventListener("change", () => {
     if ($("select-all").checked) selected.add(item.id);
     else selected.delete(item.id);
   }
-  render();
+  selectionAnchor = null;
+  rangeSelecting = false;
+  updateSelection();
 });
-$("clear-selected").addEventListener("click", () => { selected.clear(); render(); });
+$("clear-selected").addEventListener("click", () => { clearSelection(); updateSelection(); });
+$("selection-mode").addEventListener("click", () => {
+  selectionMode = !selectionMode;
+  selectionAnchor = null;
+  rangeSelecting = false;
+  updateSelection();
+});
+$("range-select").addEventListener("click", () => {
+  rangeSelecting = !rangeSelecting;
+  if (rangeSelecting) selectionMode = true;
+  selectionAnchor = null;
+  updateSelection();
+});
+$("select-visible").addEventListener("click", () => {
+  for (const item of filteredItems().slice(0, visible)) selected.add(item.id);
+  selectionAnchor = null;
+  rangeSelecting = false;
+  updateSelection();
+});
+$("invert-selection").addEventListener("click", () => {
+  for (const item of filteredItems()) {
+    if (selected.has(item.id)) selected.delete(item.id);
+    else selected.add(item.id);
+  }
+  selectionAnchor = null;
+  rangeSelecting = false;
+  updateSelection();
+});
 async function organize(payload) {
   if (organizing || !selected.size) return;
   organizing = true;
+  selectionAnchor = null;
+  rangeSelecting = false;
   updateSelection();
   const ids = [...selected];
   try {
@@ -385,7 +530,7 @@ $("save-pack").addEventListener("click", () => {
       if (editingPack) data.id = editingPack.id;
       const { pack } = await bridge.apiPost("packs/save", data);
       activePack = pack.id;
-      selected.clear();
+      clearSelection();
       $("pack-editor").close();
       await refresh();
       $("import-pack").value = pack.id;
