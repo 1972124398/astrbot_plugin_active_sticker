@@ -6,6 +6,7 @@ import tempfile
 import time
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -17,6 +18,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import ResultContentType
 from starlette.background import BackgroundTask
 
+from .exports import write_export
 from .expression import (
     CHAT_EXPRESSION_PROMPT,
     EXPRESSION_PROMPT,
@@ -121,6 +123,8 @@ class ActiveSticker(Star):
             ("delete", self.web_delete, "POST"),
             ("index", self.web_index, "POST"),
             ("catalog", self.web_catalog, "GET"),
+            ("export/csv", self.web_export_csv, "GET"),
+            ("export/documents", self.web_export_documents, "GET"),
             ("packs/save", self.web_save_pack, "POST"),
             ("packs/delete", self.web_delete_pack, "POST"),
             ("organize", self.web_organize, "POST"),
@@ -586,7 +590,17 @@ class ActiveSticker(Star):
                     if self.library.items.get(ident) is item:
                         self.index_errors[ident] = "模型没有返回有效描述，可重试或手动填写"
                 else:
-                    self.library.update(item, **values)
+                    vision_result = {
+                        **values,
+                        "provider": provider,
+                        "recognized_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    latest = self.library.items.get(ident)
+                    if latest is not None:
+                        # Organizing a picture preserves the recognition; manual wording still wins.
+                        keys = ("description", "use_when", "tags", "categories")
+                        unchanged = all(getattr(latest, key) == getattr(item, key) for key in keys)
+                        self.library.update(latest, **(values if unchanged else {}), vision_result=vision_result)
             except Exception as error:  # noqa: BLE001 - isolate provider and adapter failures
                 if self.library.items.get(ident) is item:
                     self.index_errors[ident] = f"识图失败（{type(error).__name__}），可重试或手动填写"
@@ -741,6 +755,23 @@ class ActiveSticker(Star):
 
     async def web_catalog(self):
         return file_response(self.library.root / "catalog.md", filename="catalog.md", content_type="text/markdown")
+
+    async def export_library(self, *, documents=False):
+        snapshot = self.library.export_snapshot(self.pending, self.index_errors, documents=documents)
+        path = await asyncio.to_thread(write_export, self.library.root, snapshot, documents=documents)
+        response = file_response(
+            path,
+            filename="sticker-library-documents.zip" if documents else "stickers.csv",
+            content_type="application/zip" if documents else "text/csv; charset=utf-8",
+        )
+        response.background = BackgroundTask(path.unlink, missing_ok=True)
+        return response
+
+    async def web_export_csv(self):
+        return await self.export_library()
+
+    async def web_export_documents(self):
+        return await self.export_library(documents=True)
 
     async def web_save_pack(self):
         data = await request.json(default={})

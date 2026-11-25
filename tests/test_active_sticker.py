@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import io
 import json
 import tempfile
@@ -14,6 +15,7 @@ from astrbot.api.event import MessageEventResult
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.message.message_event_result import ResultContentType
+from astrbot_plugin_active_sticker.exports import csv_bytes, csv_cell, write_export
 from astrbot_plugin_active_sticker.expression import CHAT_EXPRESSION_PROMPT, INTENT_PROMPT, selected_ids
 from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
 from astrbot_plugin_active_sticker.main import ActiveSticker
@@ -290,6 +292,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         release.set()
         await self.plugin.worker
         self.assertEqual(self.library.items[self.item.id].description, "人工描述")
+        self.assertEqual(self.library.items[self.item.id].vision_result["description"], "模型描述")
 
     async def test_pending_import_waits_for_an_available_vision_model(self):
         content = sticker_image("blue")
@@ -400,6 +403,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
 
         row = asdict(self.item)
         row.pop("pack_id")
+        row.pop("vision_result")
         self.library.index.write_text(json.dumps([row]), "utf-8")
         migrated = StickerLibrary(self.library.root)
         self.assertEqual(migrated.items[self.item.id].pack_id, "default")
@@ -555,6 +559,98 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(Path(response.path).is_file())
         await response.background()
         self.assertFalse(Path(response.path).exists())
+
+    async def test_csv_covers_all_images_and_preserves_auto_results_after_manual_edit(self):
+        self.context.llm_generate.return_value = SimpleNamespace(
+            completion_text='{"description":"自动识图：开心猫猫","use_when":"朋友接梗",'
+            '"tags":["猫猫","笑场"],"categories":["开心","调侃"]}'
+        )
+        self.plugin.queue_index([self.item])
+        await self.plugin.worker
+        item = self.library.items[self.item.id]
+        self.library.update(item, name='猫猫,"表情".png', description="人工描述\n第二行", enabled=False)
+        pack = self.library.save_pack("不启用的风格", enabled=False)
+        data = sticker_image("blue")
+        missing, _ = self.library.add("待识图.png", data, inspect_image(data), pack_id=pack.id)
+        self.library.path(missing).unlink()
+        snapshot = self.library.export_snapshot(pending=[missing.id], errors={missing.id: "源图读取失败"})
+        data = csv_bytes(snapshot)
+        self.assertTrue(data.startswith(b"\xef\xbb\xbf"))
+        rows = {row["图片ID"]: row for row in csv.DictReader(io.StringIO(data.decode("utf-8-sig")))}
+        self.assertEqual(len(rows), 2)
+        edited = rows[self.item.id]
+        self.assertEqual(edited["文件名"], '猫猫,"表情".png')
+        self.assertEqual(edited["画面与语气"], "人工描述\n第二行")
+        self.assertEqual(edited["自动识图描述"], "自动识图：开心猫猫")
+        self.assertEqual(edited["自动识图分类"], "开心、调侃")
+        self.assertEqual(edited["识图模型"], "vision")
+        self.assertTrue(edited["识图时间（UTC）"].endswith("+00:00"))
+        self.assertEqual(edited["可使用"], "否")
+        self.assertEqual(rows[missing.id]["风格包"], pack.name)
+        self.assertEqual(rows[missing.id]["源文件存在"], "否")
+        self.assertEqual(rows[missing.id]["识图状态"], "识图中")
+        self.assertEqual(rows[missing.id]["最近识图错误"], "源图读取失败")
+        self.assertEqual(rows[missing.id]["自动识图描述"], "")
+        self.assertEqual(
+            StickerLibrary(self.library.root).items[self.item.id].vision_result["tags"], ["猫猫", "笑场"]
+        )
+
+    def test_csv_formula_prefixes_are_text_and_empty_export_still_has_headers(self):
+        for text in ("=1+1", "+cmd", "-1", "@example", "  =SUM(A1)", "\tvalue", "\rvalue", "\nvalue"):
+            self.assertEqual(csv_cell(text), "'" + text)
+        self.assertEqual(csv_cell("正常文本，含逗号"), "正常文本，含逗号")
+        self.assertEqual(len(list(csv.reader(io.StringIO(csv_bytes({"rows": []}).decode("utf-8-sig"))))), 1)
+
+    def test_documents_export_contains_generated_files_and_complete_frozen_metadata(self):
+        data = sticker_image("blue")
+        unrecognized, _ = self.library.add("待识图.png", data, inspect_image(data))
+        self.library.update(self.item, name="=HYPERLINK(test)", enabled=False)
+        snapshot = self.library.export_snapshot(documents=True)
+        generated = {name: (self.library.root / name).read_bytes() for name in snapshot["documents"]}
+        self.library.delete(self.library.items[self.item.id])
+        path = write_export(self.library.root, snapshot, documents=True)
+        with zipfile.ZipFile(path) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertIn("stickers.csv", archive.namelist())
+            self.assertIn("导出说明.md", archive.namelist())
+            self.assertIn("catalog/开心.md", archive.namelist())
+            for name, content in generated.items():
+                self.assertEqual(archive.read(name), content)
+            metadata = json.loads(archive.read("index.json"))
+            self.assertEqual({item["id"] for item in metadata["items"]}, {self.item.id, unrecognized.id})
+            self.assertEqual(metadata["items"][0]["name"], "=HYPERLINK(test)")
+            rows = list(csv.DictReader(io.StringIO(archive.read("stickers.csv").decode("utf-8-sig"))))
+            self.assertEqual(rows[0]["文件名"], "'=HYPERLINK(test)")
+
+    async def test_csv_and_document_downloads_use_unique_files_and_clean_up(self):
+        for handler, filename in (
+            (self.plugin.web_export_csv, "stickers.csv"),
+            (self.plugin.web_export_documents, "sticker-library-documents.zip"),
+        ):
+            with self.subTest(filename=filename):
+                first = await handler()
+                second = await handler()
+                self.assertEqual(first.filename, filename)
+                self.assertNotEqual(first.path, second.path)
+                self.assertTrue(Path(first.path).is_file())
+                await first.background()
+                self.assertFalse(Path(first.path).exists())
+                self.assertTrue(Path(second.path).is_file())
+                await second.background()
+
+    async def test_failed_recognition_keeps_previous_successful_result(self):
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"description":"原自动识图"}')
+        self.plugin.queue_index([self.item])
+        await self.plugin.worker
+        item = self.library.items[self.item.id]
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text="invalid")
+        self.plugin.queue_index([item])
+        await self.plugin.worker
+        self.assertEqual(self.library.items[item.id].vision_result["description"], "原自动识图")
+        snapshot = self.library.export_snapshot(errors=self.plugin.index_errors)
+        rows = list(csv.DictReader(io.StringIO(csv_bytes(snapshot).decode("utf-8-sig"))))
+        self.assertEqual(rows[0]["识图状态"], "识图失败")
+        self.assertEqual(rows[0]["自动识图描述"], "原自动识图")
 
     async def test_moving_unrecognized_image_requeues_without_losing_manual_pack(self):
         pack = self.library.save_pack("猫猫")

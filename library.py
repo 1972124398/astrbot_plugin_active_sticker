@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image as PillowImage
 from PIL import ImageOps
 
-from .retrieval import CATEGORIES, CatalogIndex
+from .retrieval import CATEGORIES, CatalogIndex, inferred_categories
 
 FORMATS = {"PNG": "png", "JPEG": "jpg", "GIF": "gif", "WEBP": "webp"}
 MAX_BYTES = 16 * 1024 * 1024
@@ -43,6 +43,7 @@ class Sticker:
     revision: int = 0
     categories: tuple[str, ...] = ()
     pack_id: str = DEFAULT_PACK
+    vision_result: dict | None = None
 
     def summary(self):
         return {
@@ -276,6 +277,37 @@ class StickerLibrary:
             tuple(item for item in self.items.values() if item.pack_id == ident),
             self.catalog(ident),
         )
+
+    def export_snapshot(self, pending=(), errors=None, *, documents=False):
+        errors = errors or {}
+        rows = []
+        for item in self.items.values():
+            pack = self.packs[item.pack_id]
+            rows.append(
+                {
+                    **asdict(item),
+                    "effective_categories": inferred_categories(item),
+                    "pack_name": pack.name,
+                    "pack_description": pack.description,
+                    "pack_enabled": pack.enabled,
+                    "missing": not self.path(item).is_file(),
+                    "pending": item.id in pending,
+                    "error": errors.get(item.id, ""),
+                }
+            )
+        files = {}
+        if documents:
+            for name in ("catalog.md", "library.md", *(f"catalog/{name}.md" for name in CATEGORIES)):
+                files[name] = (self.root / name).read_bytes()
+        return {
+            "rows": rows,
+            "documents": files,
+            "metadata": {
+                "version": 2,
+                "packs": [asdict(pack) for pack in self.packs.values()],
+                "items": [asdict(item) for item in self.items.values()],
+            },
+        }
 
     def export_pack(self, ident, snapshot=None):
         """Export originals and editable metadata, including disabled/unrecognized items."""

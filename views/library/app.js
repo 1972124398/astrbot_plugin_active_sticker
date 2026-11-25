@@ -310,6 +310,17 @@ $("retry").addEventListener("click", () => action(async () => {
   await refresh();
 }));
 $("export").addEventListener("click", () => action(() => bridge.download("catalog", {}, "catalog.md")));
+for (const [id, endpoint, filename] of [
+  ["export-csv", "export/csv", "stickers.csv"],
+  ["export-documents", "export/documents", "sticker-library-documents.zip"],
+]) {
+  $(id).addEventListener("click", () => action(async () => {
+    $(id).disabled = true;
+    try {
+      await bridge.download(endpoint, {}, filename);
+    } finally { $(id).disabled = false; }
+  }));
+}
 
 $("import-pack").addEventListener("change", renderPacks);
 $("select-all").addEventListener("change", () => {
