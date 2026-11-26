@@ -105,6 +105,7 @@ class ActiveSticker(Star):
         self.config = config
         self.library = StickerLibrary(StarTools.get_data_dir(NAME))
         self.sessions = OrderedDict()
+        self.sending = {}
         self.receipts_path = self.library.root / "sent_stickers.json"
         self.receipts_lock = asyncio.Lock()
         self.load_sent_stickers()
@@ -170,7 +171,7 @@ class ActiveSticker(Star):
             self.sessions.clear()
             logger.warning("主动表情暂时无法读取已发送记录")
 
-    async def save_sent_stickers(self):
+    async def save_sent_stickers(self, *, raise_on_error=False):
         async with self.receipts_lock:
             saved = {
                 origin: {
@@ -190,7 +191,16 @@ class ActiveSticker(Star):
                     json.dumps(saved, ensure_ascii=False).encode("utf-8"),
                 )
             except OSError:
+                if raise_on_error:
+                    raise
                 logger.warning("主动表情暂时无法保存已发送记录")
+
+    async def companion_clear(self, origin, *, persona):
+        if origin in self.sending.values():
+            return "busy"
+        self.sessions.pop(origin, None)
+        await self.save_sent_stickers(raise_on_error=True)
+        return "cleared"
 
     def enabled_in(self, origin, name=NAME):
         allowed = self.context.get_config(umo=origin).get("plugin_set", ["*"])
@@ -531,12 +541,16 @@ class ActiveSticker(Star):
                     or not self.library.path(item).is_file()
                 ):
                     continue
-                delivered = await asyncio.wait_for(
-                    event.send(
-                        MessageChain([Image.fromFileSystem(str(self.library.path(item)))]),
-                    ),
-                    timeout=8,
-                )
+                self.sending[id(turn)] = turn.origin
+                try:
+                    delivered = await asyncio.wait_for(
+                        event.send(
+                            MessageChain([Image.fromFileSystem(str(self.library.path(item)))]),
+                        ),
+                        timeout=8,
+                    )
+                finally:
+                    self.sending.pop(id(turn), None)
                 if delivered is False or event.is_stopped():
                     break
                 sent = SentSticker(turn.number, time.time(), item, turn.speaker, turn.reply[:240], meaning)

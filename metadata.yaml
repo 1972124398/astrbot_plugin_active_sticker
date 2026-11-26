@@ -2,7 +2,7 @@ name: astrbot_plugin_active_sticker
 display_name: 主动表情
 short_desc: 让 AstrBot 按人格和聊天气氛自然地发表情包。
 desc: 自动识图建库、手动整理风格包，在 AI 回复后按人格选图。短期对话保持同包，默认空闲 6 小时后概率换包。支持可选联动。
-version: 1.7.0
+version: 1.7.1
 author: W1
 repo: https://github.com/1972124398/astrbot_plugin_active_sticker
 astrbot_version: ">=4.29.4,<5"

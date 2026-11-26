@@ -100,6 +100,19 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         item, _ = self.library.add("笑出屏幕.png", data, inspect_image(data))
         self.item = self.library.update(item, description="忍不住爆笑", tags=("笑场",))
 
+    async def test_companion_cleanup_invalidates_turn_and_removes_receipts(self):
+        event = Event()
+        self.expression_model([self.item.id])
+        await self.plugin.capture(event, ProviderRequest(prompt="真好笑", contexts=[]))
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        self.assertTrue(self.plugin.sessions[event.unified_msg_origin].history)
+        self.assertEqual(await self.plugin.companion_clear(event.unified_msg_origin, persona="friend"), "cleared")
+        self.assertNotIn(event.unified_msg_origin, self.plugin.sessions)
+        self.assertIn(self.item.id, self.library.items)
+        self.plugin.load_sent_stickers()
+        self.assertNotIn(event.unified_msg_origin, self.plugin.sessions)
+
     async def test_post_reply_model_observes_persona_and_optional_mood_then_sends_burst(self):
         self.stars["astrbot_plugin_short_term_mood"] = SimpleNamespace(
             activated=True,
