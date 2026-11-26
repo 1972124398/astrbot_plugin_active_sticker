@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image as PillowImage
-from PIL import ImageOps
+from PIL import ImageOps, ImageSequence
 
 from .retrieval import CATEGORIES, INDEX_VERSION, RESULT_CHARS, RESULT_LIMIT, CatalogIndex, inferred_categories
 
@@ -94,6 +94,40 @@ def vision_image(path):
         output = io.BytesIO()
         canvas.convert("RGB").save(output, "PNG")
     return output.getvalue()
+
+
+def wechat_animation_gif(path):
+    """Convert a bounded animated WebP or APNG for the adapter's GIF sticker path."""
+    try:
+        with PillowImage.open(path) as image:
+            first_frame = int(bool(image.info.get("default_image")))
+            count = getattr(image, "n_frames", 1) - first_frame
+            if not 2 <= count <= 200 or image.width * image.height * (count + first_frame) > 80_000_000:
+                return None
+            loop = min(image.info.get("loop", 0), 65_535)
+            frames, delays = [], []
+            for index, frame in enumerate(ImageSequence.Iterator(image)):
+                if index < first_frame:
+                    continue
+                rendered = frame.convert("RGBA")
+                rendered.thumbnail((512, 512), PillowImage.Resampling.LANCZOS)
+                frames.append(rendered)
+                duration = frame.info.get("duration", 100)
+                delays.append(max(20, min(10_000, round(duration / 10) * 10)))
+        # Consecutive identical frames can merge into a single GIF delay field.
+        if sum(delays) > 655_350:
+            return None
+        output = io.BytesIO()
+        frames[0].save(
+            output, format="GIF", save_all=True, append_images=frames[1:],
+            duration=delays, loop=loop, disposal=2,
+        )
+        # WeChat Native accepts uploads up to 10 MiB and fits the GIF to its sticker limits.
+        if output.tell() <= 10 * 1024 * 1024:
+            return output.getvalue()
+    except (OSError, ValueError, EOFError, SyntaxError, PillowImage.DecompressionBombError):
+        return None
+    return None
 
 
 def preview_data(path):

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import io
 import json
@@ -18,7 +19,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.core.message.message_event_result import ResultContentType
 from astrbot_plugin_active_sticker.exports import csv_bytes, csv_cell, write_export
 from astrbot_plugin_active_sticker.expression import CHAT_EXPRESSION_PROMPT, INTENT_PROMPT, selected_ids
-from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image
+from astrbot_plugin_active_sticker.library import StickerLibrary, inspect_image, vision_image, wechat_animation_gif
 from astrbot_plugin_active_sticker.main import ActiveSticker
 from astrbot_plugin_active_sticker.styles import choose_pack
 from PIL import Image
@@ -112,6 +113,81 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.item.id, self.library.items)
         self.plugin.load_sent_stickers()
         self.assertNotIn(event.unified_msg_origin, self.plugin.sessions)
+
+    async def test_wechat_native_uses_gif_sticker_path_only_when_enabled(self):
+        buffer = io.BytesIO()
+        first = Image.new("RGB", (24, 24), "red")
+        second = Image.new("RGB", (24, 24), "green")
+        first.save(buffer, format="WEBP", save_all=True, append_images=[second], duration=[80, 140], loop=2)
+        original = buffer.getvalue()
+        item, _ = self.library.add("动画.webp", original, inspect_image(original))
+        item = self.library.update(item, description="一段动图")
+
+        for platform, enabled, compression, converted in (
+            ("wechat_native", True, "auto", True),
+            ("wechat_native", False, "auto", False),
+            ("wechat_native", True, "none", False),
+            ("wechat_native", False, "none", False),
+            ("test", True, "auto", False),
+        ):
+            with self.subTest(platform=platform, enabled=enabled, compression=compression):
+                event = Event()
+                event.get_platform_name = lambda: platform
+                event.adapter = SimpleNamespace(
+                    native_config=SimpleNamespace(send_gif_as_sticker=enabled, gif_sticker_compression=compression)
+                )
+                self.expression_model([item.id])
+                await self.plugin.capture(event, ProviderRequest())
+                with patch("astrbot_plugin_active_sticker.main.asyncio.wait_for", wraps=asyncio.wait_for) as wait:
+                    await self.plugin.after_reply(event)
+                    await asyncio.gather(*list(self.plugin.tasks))
+                event.send.assert_awaited_once()
+                timeouts = [call.kwargs.get("timeout") for call in wait.call_args_list]
+                self.assertEqual(8 in timeouts, platform != "wechat_native")
+                (component,) = event.send.await_args.args[0].chain
+                if converted:
+                    data = base64.b64decode(component.file.removeprefix("base64://"))
+                    with Image.open(io.BytesIO(data)) as gif:
+                        self.assertEqual((gif.format, gif.n_frames, gif.info["loop"]), ("GIF", 2, 2))
+                        self.assertEqual(gif.info["duration"], 80)
+                        gif.seek(1)
+                        self.assertEqual(gif.info["duration"], 140)
+                else:
+                    self.assertEqual(Path(component.path), self.library.path(item))
+        self.assertEqual(self.library.path(item).read_bytes(), original)
+
+    def test_wechat_apng_conversion_skips_poster_frame(self):
+        path = self.library.root / "animation.png"
+        poster = Image.new("RGBA", (24, 24), "red")
+        first = Image.new("RGBA", (24, 24), "green")
+        second = Image.new("RGBA", (24, 24), "blue")
+        poster.save(path, save_all=True, append_images=[first, second], default_image=True, duration=[70, 160])
+        with Image.open(io.BytesIO(wechat_animation_gif(path))) as gif:
+            self.assertEqual(gif.n_frames, 2)
+            self.assertEqual(gif.convert("RGB").getpixel((0, 0)), (0, 128, 0))
+            self.assertEqual(gif.info["duration"], 70)
+            gif.seek(1)
+            self.assertEqual(gif.info["duration"], 160)
+
+    async def test_wechat_sends_original_gif_bytes_without_conversion(self):
+        buffer = io.BytesIO()
+        frames = [Image.new("RGB", (24, 24), color) for color in ("red", "green")]
+        frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=[80, 140])
+        original = buffer.getvalue()
+        item, _ = self.library.add("动画.gif", original, inspect_image(original))
+        item = self.library.update(item, description="原始 GIF")
+        event = Event()
+        event.get_platform_name = lambda: "wechat_native"
+        event.adapter = SimpleNamespace(
+            native_config=SimpleNamespace(send_gif_as_sticker=True, gif_sticker_compression="auto")
+        )
+        self.expression_model([item.id], meaning="原始 GIF")
+        await self.plugin.capture(event, ProviderRequest())
+        await self.plugin.after_reply(event)
+        await asyncio.gather(*list(self.plugin.tasks))
+        event.send.assert_awaited_once()
+        (component,) = event.send.await_args.args[0].chain
+        self.assertEqual(Path(component.path).read_bytes(), original)
 
     async def test_post_reply_model_observes_persona_and_optional_mood_then_sends_burst(self):
         self.stars["astrbot_plugin_short_term_mood"] = SimpleNamespace(

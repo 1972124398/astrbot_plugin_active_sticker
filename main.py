@@ -28,7 +28,16 @@ from .expression import (
     object_response,
     selected_ids,
 )
-from .library import DEFAULT_PACK, MAX_BYTES, Sticker, StickerLibrary, inspect_image, preview_data, vision_image
+from .library import (
+    DEFAULT_PACK,
+    MAX_BYTES,
+    Sticker,
+    StickerLibrary,
+    inspect_image,
+    preview_data,
+    vision_image,
+    wechat_animation_gif,
+)
 from .retrieval import CATEGORIES, category_names, inferred_categories, retrieval_fields
 from .styles import PackLease, choose_pack
 
@@ -527,7 +536,7 @@ class ActiveSticker(Star):
             for index, ident in enumerate(ids):
                 if index:
                     await asyncio.sleep(0.45)
-                if not self.current(turn):
+                if not self.current(turn) or event.is_stopped():
                     break
                 item = self.library.items.get(ident)
                 pack = self.library.packs.get(turn.pack_id)
@@ -541,14 +550,28 @@ class ActiveSticker(Star):
                     or not self.library.path(item).is_file()
                 ):
                     continue
+                path = self.library.path(item)
+                native = event.get_platform_name() == "wechat_native"
+                native_config = getattr(getattr(event, "adapter", None), "native_config", None) if native else None
+                component = Image.fromFileSystem(str(path))
+                if (
+                    item.animated
+                    and item.extension in {"png", "webp"}
+                    and getattr(native_config, "send_gif_as_sticker", False)
+                    and getattr(native_config, "gif_sticker_compression", "none") != "none"
+                ):
+                    gif = await asyncio.to_thread(wechat_animation_gif, path)
+                    if not self.current(turn) or event.is_stopped():
+                        break
+                    if self.library.items.get(ident) is not item or self.library.packs.get(pack.id) is not pack:
+                        continue
+                    if gif:
+                        component = Image.fromBytes(gif)
                 self.sending[id(turn)] = turn.origin
                 try:
-                    delivered = await asyncio.wait_for(
-                        event.send(
-                            MessageChain([Image.fromFileSystem(str(self.library.path(item)))]),
-                        ),
-                        timeout=8,
-                    )
+                    send = event.send(MessageChain([component]))
+                    # Native bounds preparation and receipt polling within the adapter.
+                    delivered = await send if native else await asyncio.wait_for(send, timeout=8)
                 finally:
                     self.sending.pop(id(turn), None)
                 if delivered is False or event.is_stopped():
