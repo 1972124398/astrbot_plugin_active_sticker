@@ -194,11 +194,26 @@ class ActiveSticker(Star):
                 if session.history or session.packs
             }
             try:
-                await asyncio.to_thread(
-                    self.library.write,
-                    self.receipts_path,
-                    json.dumps(saved, ensure_ascii=False).encode("utf-8"),
+                writing = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.library.write,
+                        self.receipts_path,
+                        json.dumps(saved, ensure_ascii=False).encode("utf-8"),
+                    )
                 )
+                try:
+                    await asyncio.shield(writing)
+                except asyncio.CancelledError:
+                    # A cancelled coroutine does not stop its filesystem thread.
+                    # Keep the writer serialized even if shutdown cancels us again.
+                    while not writing.done():
+                        try:
+                            await asyncio.wait({writing})
+                        except asyncio.CancelledError:
+                            continue
+                    if not writing.cancelled():
+                        writing.exception()
+                    raise
             except OSError:
                 if raise_on_error:
                     raise
@@ -505,14 +520,15 @@ class ActiveSticker(Star):
                 searches.add(search_key)
                 candidates, entries = search_index.search(query, categories, exclude=seen, compact=True)
                 seen.update(item.id for item in candidates)
+                # Keep the pack catalogue ahead of values that change with each search.
                 selection_scene = {
-                    "我已决定的表达意图": meaning,
-                    "已经发出的回复": turn.reply[-500:],
-                    "当前说话人": turn.speaker,
                     "本组可用图片数上限": max_images,
                     "当前风格包": self.library.packs[turn.pack_id].name,
                     "选图约束": "只使用当前风格包。没有贴切素材就不发，不跨包补图。",
                     "分类文档目录": search_index.directory(),
+                    "我已决定的表达意图": meaning,
+                    "已经发出的回复": turn.reply[-500:],
+                    "当前说话人": turn.speaker,
                     "本次检索": {"query": query, "categories": categories},
                     "文档匹配条目": entries,
                 }

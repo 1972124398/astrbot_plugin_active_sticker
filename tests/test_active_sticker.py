@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 import zipfile
 from collections import OrderedDict
@@ -113,6 +114,41 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.item.id, self.library.items)
         self.plugin.load_sent_stickers()
         self.assertNotIn(event.unified_msg_origin, self.plugin.sessions)
+
+    async def test_cancelled_receipt_write_cannot_overwrite_conversation_cleanup(self):
+        event = Event()
+        await self.plugin.capture(event, ProviderRequest(prompt="真好笑", contexts=[]))
+        started = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        write = self.library.write
+
+        def delayed_write(path, data):
+            if json.loads(data):
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(timeout=3):
+                    raise TimeoutError("Test did not release the receipt writer")
+            write(path, data)
+
+        with patch.object(self.library, "write", side_effect=delayed_write):
+            save = asyncio.create_task(self.plugin.save_sent_stickers())
+            cleanup = None
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                for _ in range(2):
+                    save.cancel()
+                    await asyncio.sleep(0)
+                cleanup = asyncio.create_task(self.plugin.companion_clear(event.unified_msg_origin, persona="friend"))
+                await asyncio.sleep(0)
+                self.assertTrue(self.plugin.receipts_lock.locked())
+                self.assertFalse(save.done())
+            finally:
+                release.set()
+                await asyncio.gather(save, return_exceptions=True)
+                if cleanup is not None:
+                    await cleanup
+        self.assertTrue(save.cancelled())
+        self.assertEqual(json.loads(self.plugin.receipts_path.read_bytes()), {})
 
     async def test_wechat_native_uses_gif_sticker_path_only_when_enabled(self):
         buffer = io.BytesIO()
@@ -755,6 +791,7 @@ class StickerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("人格", intent)
         for key in ("人格", "最近对话", "当前情绪", "长期表达习惯", "自己已发的表情"):
             self.assertNotIn(key, selection)
+        self.assertLess(list(selection).index("分类文档目录"), list(selection).index("我已决定的表达意图"))
         self.assertEqual(selection["文档匹配条目"][0]["id"], "1")
         self.assertNotIn(self.item.id, json.dumps(selection))
         self.assertEqual(event.send.await_count, 2)
